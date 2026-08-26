@@ -1,1 +1,35 @@
+# Environment secrets
 .env
+.env.*
+
+# Virtual environments
+venv/
+.venv/
+
+# Whisper downloaded models
+asrmodel/
+*.pt
+
+# Test and temporary audio files
+*.mp3
+*.wav
+*.webm
+*.tmp
+recording.tmp.webm
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+temp/
+tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+# Local test and backup files
+test_audio.py
+test_gemini.py
+voicechat_backup.py

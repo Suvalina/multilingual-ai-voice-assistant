@@ -1,3 +1,4 @@
+
 import os
 import time
 import uuid
@@ -37,14 +38,12 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# KEEP MEDIUM FOR HIGH ACCURACY
 WHISPER_MODEL_NAME = os.getenv(
     "WHISPER_MODEL",
     "medium"
 ).strip()
 
-
-# IMPORTANT:
-# Your API key successfully tested with this model.
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
@@ -57,7 +56,7 @@ if not GEMINI_API_KEY:
         """
         ❌ GEMINI_API_KEY not found.
 
-        Create a .env file:
+        Configure your Streamlit Secret:
 
         GEMINI_API_KEY=YOUR_API_KEY
         WHISPER_MODEL=medium
@@ -148,7 +147,6 @@ LANGUAGE_NAMES = {
 
     "sw": "Swahili",
     "af": "Afrikaans",
-
 }
 
 
@@ -157,7 +155,6 @@ LANGUAGE_NAMES = {
 # ============================================================
 
 PREFERRED_LANGUAGES = {
-
     "en",
     "hi",
     "bn",
@@ -177,99 +174,60 @@ PREFERRED_LANGUAGES = {
 TTS_VOICES = {
 
     "en": "en-US-JennyNeural",
-
     "hi": "hi-IN-SwaraNeural",
-
     "bn": "bn-IN-TanishaaNeural",
-
     "or": "or-IN-SubhasiniNeural",
-
     "ta": "ta-IN-PallaviNeural",
-
     "te": "te-IN-ShrutiNeural",
-
     "ne": "ne-NP-HemkalaNeural",
-
     "gu": "gu-IN-DhwaniNeural",
-
     "as": "as-IN-PriyomNeural",
 
     "mr": "mr-IN-AarohiNeural",
-
     "kn": "kn-IN-SapnaNeural",
-
     "ml": "ml-IN-SobhanaNeural",
-
     "pa": "pa-IN-VaaniNeural",
-
     "ur": "ur-PK-AsadNeural",
 
     "fr": "fr-FR-DeniseNeural",
-
     "de": "de-DE-KatjaNeural",
-
     "es": "es-ES-ElviraNeural",
-
     "it": "it-IT-ElsaNeural",
-
     "pt": "pt-PT-RaquelNeural",
 
     "ja": "ja-JP-NanamiNeural",
-
     "ko": "ko-KR-SunHiNeural",
-
     "zh": "zh-CN-XiaoxiaoNeural",
-
     "ru": "ru-RU-SvetlanaNeural",
-
     "ar": "ar-SA-ZariyahNeural",
 
     "tr": "tr-TR-EmelNeural",
-
     "id": "id-ID-GadisNeural",
-
     "vi": "vi-VN-HoaiMyNeural",
-
     "th": "th-TH-PremwadeeNeural",
 
     "pl": "pl-PL-ZofiaNeural",
-
     "nl": "nl-NL-ColetteNeural",
-
     "sv": "sv-SE-SofieNeural",
-
     "da": "da-DK-ChristelNeural",
-
     "fi": "fi-FI-NooraNeural",
 
     "uk": "uk-UA-PolinaNeural",
-
     "cs": "cs-CZ-VlastaNeural",
-
     "ro": "ro-RO-AlinaNeural",
-
     "el": "el-GR-AthinaNeural",
-
     "he": "he-IL-HilaNeural",
 
     "hu": "hu-HU-NoemiNeural",
-
     "no": "nb-NO-PernilleNeural",
-
     "sk": "sk-SK-ViktoriaNeural",
-
     "bg": "bg-BG-KalinaNeural",
-
     "hr": "hr-HR-GabrijelaNeural",
-
     "sr": "sr-RS-SophieNeural",
-
     "sl": "sl-SI-PetraNeural",
 
     "sw": "sw-KE-ZuriNeural",
-
     "af": "af-ZA-AdriNeural",
-
 }
 
 
@@ -296,7 +254,6 @@ DEFAULT_STATE = {
     "image_part": None,
 
     "file_part": None,
-
 }
 
 
@@ -310,18 +267,22 @@ for key, value in DEFAULT_STATE.items():
 # ============================================================
 # WHISPER
 # ============================================================
+# IMPORTANT:
+# Whisper is NOT loaded when the application starts.
+# It is loaded only when the user clicks
+# "Transcribe Voice".
+#
+# This keeps the Streamlit application from loading
+# the 1.4+ GB medium model during startup.
+# ============================================================
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_whisper():
 
-    with st.spinner(
-        f"⏳ Loading Whisper {WHISPER_MODEL_NAME}..."
-    ):
-
-        model = whisper.load_model(
-            WHISPER_MODEL_NAME,
-            download_root="asrmodel"
-        )
+    model = whisper.load_model(
+        WHISPER_MODEL_NAME,
+        download_root="asrmodel"
+    )
 
     return model
 
@@ -346,7 +307,6 @@ def extract_pdf_text(file_bytes):
 
             f.write(file_bytes)
 
-
         reader = PdfReader(temp_path)
 
         pages = []
@@ -365,24 +325,25 @@ def extract_pdf_text(file_bytes):
 
                 pass
 
-
         return "\n\n".join(
             pages
         ).strip()
-
 
     except Exception:
 
         return ""
 
-
     finally:
 
         try:
 
-            if os.path.exists(temp_path):
+            if os.path.exists(
+                temp_path
+            ):
 
-                os.remove(temp_path)
+                os.remove(
+                    temp_path
+                )
 
         except Exception:
 
@@ -409,7 +370,6 @@ def extract_docx_text(file_bytes):
 
             f.write(file_bytes)
 
-
         document = Document(temp_path)
 
         paragraphs = []
@@ -422,24 +382,25 @@ def extract_docx_text(file_bytes):
 
                 paragraphs.append(text)
 
-
         return "\n".join(
             paragraphs
         ).strip()
-
 
     except Exception:
 
         return ""
 
-
     finally:
 
         try:
 
-            if os.path.exists(temp_path):
+            if os.path.exists(
+                temp_path
+            ):
 
-                os.remove(temp_path)
+                os.remove(
+                    temp_path
+                )
 
         except Exception:
 
@@ -455,7 +416,6 @@ def process_attachment(uploaded_file):
     if uploaded_file is None:
 
         return "", None, None
-
 
     filename = uploaded_file.name
 
@@ -490,14 +450,10 @@ def process_attachment(uploaded_file):
 
             mime_type = "image/jpeg"
 
-
         image_part = types.Part.from_bytes(
-
             data=file_bytes,
-
             mime_type=mime_type
         )
-
 
         context = f"""
 IMAGE ATTACHMENT:
@@ -509,7 +465,6 @@ The image is attached directly to this request.
 
 Analyze the image when the user asks about it.
 """
-
 
         return (
             context,
@@ -528,15 +483,10 @@ Analyze the image when the user asks about it.
             file_bytes
         )
 
-
-        # Direct PDF part for Gemini
         pdf_part = types.Part.from_bytes(
-
             data=file_bytes,
-
             mime_type="application/pdf"
         )
-
 
         if extracted_text:
 
@@ -570,7 +520,6 @@ It may be scanned or image-based.
 Analyze it if possible.
 """
 
-
         return (
             context,
             None,
@@ -588,7 +537,6 @@ Analyze it if possible.
             file_bytes
         )
 
-
         context = f"""
 DOCX ATTACHMENT:
 
@@ -599,7 +547,6 @@ Document content:
 
 {text[:120000]}
 """
-
 
         return (
             context,
@@ -623,7 +570,6 @@ Document content:
             errors="ignore"
         )
 
-
         context = f"""
 TEXT ATTACHMENT:
 
@@ -634,7 +580,6 @@ Content:
 
 {text[:120000]}
 """
-
 
         return (
             context,
@@ -666,13 +611,11 @@ def generate_gemini_response(
 
     last_error = None
 
-
     for attempt in range(4):
 
         try:
 
             parts = []
-
 
             if image_part is not None:
 
@@ -680,20 +623,17 @@ def generate_gemini_response(
                     image_part
                 )
 
-
             if file_part is not None:
 
                 parts.append(
                     file_part
                 )
 
-
             parts.append(
                 types.Part.from_text(
                     text=prompt
                 )
             )
-
 
             response = client.models.generate_content(
 
@@ -714,7 +654,6 @@ def generate_gemini_response(
                 )
             )
 
-
             if response is not None:
 
                 response_text = (
@@ -723,11 +662,9 @@ def generate_gemini_response(
                     else ""
                 )
 
-
                 if response_text.strip():
 
                     return response_text.strip()
-
 
             raise RuntimeError(
                 "Gemini returned an empty response."
@@ -739,7 +676,6 @@ def generate_gemini_response(
             last_error = e
 
             error_text = str(e).upper()
-
 
             temporary_error = (
 
@@ -758,11 +694,9 @@ def generate_gemini_response(
                 or "504" in error_text
             )
 
-
             if not temporary_error:
 
                 raise
-
 
             if attempt < 3:
 
@@ -789,7 +723,6 @@ def language_instruction(language_code):
         language_code,
         language_code
     )
-
 
     return f"""
 LANGUAGE INFORMATION
@@ -846,7 +779,6 @@ def build_history():
         st.session_state.messages[-12:]
     )
 
-
     for message in recent_messages:
 
         role = message.get(
@@ -859,14 +791,12 @@ def build_history():
             ""
         )
 
-
         if content:
 
             history += (
                 f"{role.upper()}: "
                 f"{content}\n"
             )
-
 
     return history
 
@@ -885,9 +815,7 @@ def ask_ai(
 
     history_text = build_history()
 
-
     attachment_section = ""
-
 
     if attachment_context:
 
@@ -898,7 +826,6 @@ ATTACHMENT INFORMATION:
 
 Use the attachment when it is relevant.
 """
-
 
     prompt = f"""
 You are a highly capable multilingual AI assistant.
@@ -929,7 +856,8 @@ RULES:
 
 6. If a DOCX is attached, use its contents when relevant.
 
-7. If the user asks to summarize a file, summarize that file.
+7. If the user asks to summarize a file,
+summarize that file.
 
 8. If the user asks questions about a document,
 answer based on the document.
@@ -952,7 +880,6 @@ answer based on the document.
 
 Now answer the user.
 """
-
 
     return generate_gemini_response(
 
@@ -1000,7 +927,6 @@ def transcribe_audio(
         verbose=False
     )
 
-
     language_code = (
         result.get(
             "language",
@@ -1010,7 +936,6 @@ def transcribe_audio(
         .lower()
     )
 
-
     text = (
         result.get(
             "text",
@@ -1019,13 +944,11 @@ def transcribe_audio(
         .strip()
     )
 
-
     # Whisper does not have a separate
     # Bihari language model/code.
     if language_code == "bh":
 
         language_code = "hi"
-
 
     return (
         language_code,
@@ -1056,7 +979,6 @@ async def generate_tts(
         pitch="+0Hz"
     )
 
-
     await communicate.save(
         output_file
     )
@@ -1071,11 +993,9 @@ def create_voice(
 
         return None
 
-
     voice = TTS_VOICES.get(
         language_code
     )
-
 
     # Hindi fallback
     if not voice:
@@ -1084,14 +1004,12 @@ def create_voice(
             "hi"
         )
 
-
     output_file = os.path.join(
 
         tempfile.gettempdir(),
 
         f"tts_{uuid.uuid4().hex}.mp3"
     )
-
 
     try:
 
@@ -1107,13 +1025,11 @@ def create_voice(
             )
         )
 
-
         if not os.path.exists(
             output_file
         ):
 
             return None
-
 
         with open(
             output_file,
@@ -1122,11 +1038,9 @@ def create_voice(
 
             return f.read()
 
-
     except Exception:
 
         return None
-
 
     finally:
 
@@ -1166,7 +1080,6 @@ def new_chat():
             "New conversation"
         )
 
-
         title = (
 
             first_user_message[:50]
@@ -1176,7 +1089,6 @@ def new_chat():
                 " "
             )
         )
-
 
         if title:
 
@@ -1214,11 +1126,9 @@ def render_sidebar():
             "# 🎙️ AI Assistant"
         )
 
-
         st.caption(
             f"Gemini: {GEMINI_MODEL}"
         )
-
 
         if st.button(
             "➕ New Chat",
@@ -1229,9 +1139,7 @@ def render_sidebar():
 
             st.rerun()
 
-
         st.divider()
-
 
         # ====================================================
         # SEARCH
@@ -1241,7 +1149,6 @@ def render_sidebar():
             "### 🔎 Search History"
         )
 
-
         search = st.text_input(
 
             "Search",
@@ -1249,16 +1156,13 @@ def render_sidebar():
             placeholder="Search conversations..."
         )
 
-
         st.markdown(
             "### 🕘 Conversations"
         )
 
-
         titles = (
             st.session_state.conversation_titles
         )
-
 
         if search:
 
@@ -1271,7 +1175,6 @@ def render_sidebar():
                 if search.lower()
                 in title.lower()
             ]
-
 
         if titles:
 
@@ -1287,14 +1190,11 @@ def render_sidebar():
                 "No saved conversations yet."
             )
 
-
         st.divider()
-
 
         st.markdown(
             "### 🌍 Languages"
         )
-
 
         st.caption(
             """
@@ -1326,9 +1226,7 @@ and more.
 """
         )
 
-
         st.divider()
-
 
         if st.button(
             "🗑️ Clear Session History",
@@ -1359,7 +1257,6 @@ def display_message(message):
         ""
     )
 
-
     with st.chat_message(
         role
     ):
@@ -1367,7 +1264,6 @@ def display_message(message):
         st.markdown(
             content
         )
-
 
         if message.get(
             "audio"
@@ -1379,7 +1275,6 @@ def display_message(message):
 
                 format="audio/mp3"
             )
-
 
         if message.get(
             "file_name"
@@ -1406,7 +1301,6 @@ def process_user_message(
         )
     )
 
-
     attachment_filename = (
         st.session_state.get(
             "uploaded_filename",
@@ -1414,14 +1308,12 @@ def process_user_message(
         )
     )
 
-
     image_part = (
         st.session_state.get(
             "image_part",
             None
         )
     )
-
 
     file_part = (
         st.session_state.get(
@@ -1468,11 +1360,9 @@ def process_user_message(
                 file_part
             )
 
-
         except Exception as e:
 
             error_text = str(e)
-
 
             if (
 
@@ -1488,7 +1378,6 @@ def process_user_message(
                     "Please try again in a few seconds."
                 )
 
-
             elif (
 
                 "429" in error_text
@@ -1503,7 +1392,6 @@ def process_user_message(
                     "Gemini request limit was reached. "
                     "Please wait a little and try again."
                 )
-
 
             else:
 
@@ -1521,7 +1409,6 @@ def process_user_message(
     # ========================================================
 
     audio_bytes = None
-
 
     with st.spinner(
         "🔊 Generating voice..."
@@ -1579,31 +1466,22 @@ def main():
         "🎙️ Multilingual AI Voice Assistant"
     )
 
-
     st.caption(
         "Voice • Chat • Image • PDF • DOCX • AI • TTS"
     )
 
 
     # ========================================================
-    # LOAD WHISPER
+    # IMPORTANT
     # ========================================================
-
-    try:
-
-        whisper_model = load_whisper()
-
-    except Exception as e:
-
-        st.error(
-            f"""
-❌ Whisper could not load.
-
-{e}
-"""
-        )
-
-        st.stop()
+    # Whisper is intentionally NOT loaded here.
+    #
+    # It will only load when the user clicks
+    # "Transcribe Voice".
+    #
+    # This prevents the 1.42 GB medium model from
+    # loading during normal application startup.
+    # ========================================================
 
 
     # ========================================================
@@ -1624,7 +1502,6 @@ def main():
     st.markdown(
         "### 📎 Attach File"
     )
-
 
     uploaded_file = st.file_uploader(
 
@@ -1691,26 +1568,21 @@ def main():
                     )
                 )
 
-
                 st.session_state.uploaded_context = (
                     context
                 )
-
 
                 st.session_state.uploaded_filename = (
                     uploaded_file.name
                 )
 
-
                 st.session_state.image_part = (
                     image_part
                 )
 
-
                 st.session_state.file_part = (
                     file_part
                 )
-
 
             except Exception as e:
 
@@ -1746,7 +1618,6 @@ def main():
         "### 🎤 Voice Input"
     )
 
-
     audio = st.audio_input(
 
         "Click microphone and speak",
@@ -1776,8 +1647,22 @@ def main():
 
             temp_audio = None
 
-
             try:
+
+                # ====================================================
+                # LOAD WHISPER ONLY NOW
+                # ====================================================
+
+                with st.spinner(
+                    f"⏳ Loading Whisper {WHISPER_MODEL_NAME}..."
+                ):
+
+                    whisper_model = load_whisper()
+
+
+                # ====================================================
+                # SAVE AUDIO TEMPORARILY
+                # ====================================================
 
                 temp_audio = os.path.join(
 
@@ -1796,6 +1681,10 @@ def main():
                         audio.getbuffer()
                     )
 
+
+                # ====================================================
+                # TRANSCRIBE
+                # ====================================================
 
                 with st.spinner(
                     "🌍 Detecting language and transcribing..."
@@ -1827,17 +1716,16 @@ def main():
                         text
                     )
 
-
                     st.session_state.pending_language = (
                         language_code
                     )
-
 
                     st.success(
 
                         "Detected language: "
 
                         +
+
                         LANGUAGE_NAMES.get(
 
                             language_code,
@@ -1888,7 +1776,6 @@ def main():
             "### 📝 Your Voice Transcript"
         )
 
-
         detected_name = (
             LANGUAGE_NAMES.get(
 
@@ -1898,11 +1785,9 @@ def main():
             )
         )
 
-
         st.info(
             f"🌍 Detected language: {detected_name}"
         )
-
 
         edited_transcript = st.text_area(
 
@@ -1915,9 +1800,7 @@ def main():
             key="editable_transcript"
         )
 
-
         col1, col2 = st.columns(2)
-
 
         with col1:
 
@@ -1950,11 +1833,9 @@ def main():
                     edited_transcript.strip()
                 )
 
-
                 language_code = (
                     st.session_state.pending_language
                 )
-
 
                 if not user_text:
 
@@ -1970,7 +1851,6 @@ def main():
 
                         language_code
                     )
-
 
                     st.session_state.pending_transcript = ""
 
@@ -1989,7 +1869,6 @@ def main():
         "### 💬 Chat"
     )
 
-
     prompt = st.chat_input(
 
         "Message your AI assistant..."
@@ -2000,13 +1879,13 @@ def main():
 
         # For text chat we allow Gemini
         # to understand the language itself.
+
         process_user_message(
 
             prompt,
 
             "auto"
         )
-
 
         st.rerun()
 

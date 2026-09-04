@@ -1,4 +1,3 @@
-
 import os
 import time
 import uuid
@@ -7,7 +6,7 @@ import asyncio
 from pathlib import Path
 
 import streamlit as st
-import whisper
+from faster_whisper import WhisperModel
 import edge_tts
 
 from dotenv import load_dotenv
@@ -19,26 +18,16 @@ from docx import Document
 
 
 # ============================================================
-# PAGE CONFIG
-# ============================================================
-
-st.set_page_config(
-    page_title="Multilingual AI Voice Assistant",
-    page_icon="🎙️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-# ============================================================
 # ENVIRONMENT
 # ============================================================
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    ""
+).strip()
 
-# KEEP MEDIUM FOR HIGH ACCURACY
 WHISPER_MODEL_NAME = os.getenv(
     "WHISPER_MODEL",
     "medium"
@@ -49,19 +38,32 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.5-flash-lite"
 ).strip()
 
+FALLBACK_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Multilingual AI Voice Assistant",
+    page_icon="🎙️",
+    layout="wide",
+)
+
+
+# ============================================================
+# API KEY CHECK
+# ============================================================
 
 if not GEMINI_API_KEY:
 
     st.error(
-        """
-        ❌ GEMINI_API_KEY not found.
-
-        Configure your Streamlit Secret:
-
-        GEMINI_API_KEY=YOUR_API_KEY
-        WHISPER_MODEL=medium
-        GEMINI_MODEL=gemini-3.5-flash-lite
-        """
+        "❌ GEMINI_API_KEY is missing. "
+        "Please add it to Streamlit Secrets or your .env file."
     )
 
     st.stop()
@@ -71,19 +73,9 @@ if not GEMINI_API_KEY:
 # GEMINI CLIENT
 # ============================================================
 
-try:
-
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-
-except Exception as e:
-
-    st.error(
-        f"❌ Gemini initialization failed:\n\n{e}"
-    )
-
-    st.stop()
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 
 # ============================================================
@@ -91,7 +83,6 @@ except Exception as e:
 # ============================================================
 
 LANGUAGE_NAMES = {
-
     "en": "English",
     "hi": "Hindi",
     "bn": "Bengali",
@@ -101,7 +92,6 @@ LANGUAGE_NAMES = {
     "ne": "Nepali",
     "gu": "Gujarati",
     "as": "Assamese",
-
     "mr": "Marathi",
     "kn": "Kannada",
     "ml": "Malayalam",
@@ -117,10 +107,11 @@ LANGUAGE_NAMES = {
     "ja": "Japanese",
     "ko": "Korean",
     "zh": "Chinese",
+
     "ru": "Russian",
     "ar": "Arabic",
-
     "tr": "Turkish",
+
     "id": "Indonesian",
     "vi": "Vietnamese",
     "th": "Thai",
@@ -151,29 +142,12 @@ LANGUAGE_NAMES = {
 
 
 # ============================================================
-# PREFERRED LANGUAGES
-# ============================================================
-
-PREFERRED_LANGUAGES = {
-    "en",
-    "hi",
-    "bn",
-    "or",
-    "ta",
-    "te",
-    "ne",
-    "gu",
-    "as",
-}
-
-
-# ============================================================
-# TTS VOICES
+# EDGE TTS VOICES
 # ============================================================
 
 TTS_VOICES = {
+    "en": "en-US-AriaNeural",
 
-    "en": "en-US-JennyNeural",
     "hi": "hi-IN-SwaraNeural",
     "bn": "bn-IN-TanishaaNeural",
     "or": "or-IN-SubhasiniNeural",
@@ -182,26 +156,26 @@ TTS_VOICES = {
     "ne": "ne-NP-HemkalaNeural",
     "gu": "gu-IN-DhwaniNeural",
     "as": "as-IN-PriyomNeural",
-
     "mr": "mr-IN-AarohiNeural",
     "kn": "kn-IN-SapnaNeural",
     "ml": "ml-IN-SobhanaNeural",
-    "pa": "pa-IN-VaaniNeural",
+    "pa": "pa-IN-OjasNeural",
     "ur": "ur-PK-AsadNeural",
 
     "fr": "fr-FR-DeniseNeural",
     "de": "de-DE-KatjaNeural",
     "es": "es-ES-ElviraNeural",
     "it": "it-IT-ElsaNeural",
-    "pt": "pt-PT-RaquelNeural",
+    "pt": "pt-BR-FranciscaNeural",
 
     "ja": "ja-JP-NanamiNeural",
     "ko": "ko-KR-SunHiNeural",
     "zh": "zh-CN-XiaoxiaoNeural",
+
     "ru": "ru-RU-SvetlanaNeural",
     "ar": "ar-SA-ZariyahNeural",
-
     "tr": "tr-TR-EmelNeural",
+
     "id": "id-ID-GadisNeural",
     "vi": "vi-VN-HoaiMyNeural",
     "th": "th-TH-PremwadeeNeural",
@@ -219,7 +193,7 @@ TTS_VOICES = {
     "he": "he-IL-HilaNeural",
 
     "hu": "hu-HU-NoemiNeural",
-    "no": "nb-NO-PernilleNeural",
+    "no": "nb-NO-IselinNeural",
     "sk": "sk-SK-ViktoriaNeural",
     "bg": "bg-BG-KalinaNeural",
     "hr": "hr-HR-GabrijelaNeural",
@@ -235,29 +209,19 @@ TTS_VOICES = {
 # SESSION STATE
 # ============================================================
 
-DEFAULT_STATE = {
-
+DEFAULTS = {
     "messages": [],
-
     "conversation_titles": [],
-
     "pending_transcript": "",
-
     "pending_language": "en",
-
     "recorder_key": 0,
-
     "uploaded_context": "",
-
     "uploaded_filename": "",
-
     "image_part": None,
-
     "file_part": None,
 }
 
-
-for key, value in DEFAULT_STATE.items():
+for key, value in DEFAULTS.items():
 
     if key not in st.session_state:
 
@@ -265,634 +229,407 @@ for key, value in DEFAULT_STATE.items():
 
 
 # ============================================================
-# WHISPER
+# TEXT LANGUAGE DETECTION
 # ============================================================
-# IMPORTANT:
-# Whisper is NOT loaded when the application starts.
-# It is loaded only when the user clicks
-# "Transcribe Voice".
-#
-# This keeps the Streamlit application from loading
-# the 1.4+ GB medium model during startup.
+
+def detect_text_language(text):
+    """
+    Detect language from:
+
+    1. Unicode script
+    2. Romanized Bengali
+    3. Common Romanized Indian words
+
+    Examples:
+
+    আমি কেমন আছি       -> bn
+    ami kemon achi     -> bn
+    ami bhalo achi     -> bn
+    tumi ki korcho     -> bn
+    amar naam Suval   -> bn
+    How are you       -> en
+    आप कैसे हैं       -> hi
+    """
+
+    if not text:
+        return "en"
+
+    text = text.strip()
+
+    if not text:
+        return "en"
+
+    # ========================================================
+    # 1. UNICODE SCRIPT DETECTION
+    # ========================================================
+
+    chars = [
+        ch
+        for ch in text
+        if ch.isalpha()
+    ]
+
+    if chars:
+
+        script_counts = {}
+
+        for ch in chars:
+
+            code = ord(ch)
+            detected = None
+
+            # Bengali
+            if 0x0980 <= code <= 0x09FF:
+                detected = "bn"
+
+            # Devanagari
+            elif 0x0900 <= code <= 0x097F:
+                detected = "hi"
+
+            # Gujarati
+            elif 0x0A80 <= code <= 0x0AFF:
+                detected = "gu"
+
+            # Punjabi / Gurmukhi
+            elif 0x0A00 <= code <= 0x0A7F:
+                detected = "pa"
+
+            # Odia
+            elif 0x0B00 <= code <= 0x0B7F:
+                detected = "or"
+
+            # Tamil
+            elif 0x0B80 <= code <= 0x0BFF:
+                detected = "ta"
+
+            # Telugu
+            elif 0x0C00 <= code <= 0x0C7F:
+                detected = "te"
+
+            # Kannada
+            elif 0x0C80 <= code <= 0x0CFF:
+                detected = "kn"
+
+            # Malayalam
+            elif 0x0D00 <= code <= 0x0D7F:
+                detected = "ml"
+
+            # Thai
+            elif 0x0E00 <= code <= 0x0E7F:
+                detected = "th"
+
+            # Hebrew
+            elif 0x0590 <= code <= 0x05FF:
+                detected = "he"
+
+            # Arabic / Urdu
+            elif 0x0600 <= code <= 0x06FF:
+                detected = "ur"
+
+            # Japanese
+            elif (
+                0x3040 <= code <= 0x309F
+                or 0x30A0 <= code <= 0x30FF
+            ):
+                detected = "ja"
+
+            # Korean
+            elif 0xAC00 <= code <= 0xD7AF:
+                detected = "ko"
+
+            # Chinese
+            elif 0x4E00 <= code <= 0x9FFF:
+                detected = "zh"
+
+            if detected:
+
+                script_counts[detected] = (
+                    script_counts.get(
+                        detected,
+                        0
+                    ) + 1
+                )
+
+        if script_counts:
+
+            return max(
+                script_counts,
+                key=script_counts.get
+            )
+
+    # ========================================================
+    # 2. ROMANIZED BENGALI
+    # ========================================================
+
+    lower_text = text.lower()
+
+    normalized_text = ""
+
+    for ch in lower_text:
+
+        if ch.isalnum() or ch.isspace():
+
+            normalized_text += ch
+
+        else:
+
+            normalized_text += " "
+
+    words = set(
+        normalized_text.split()
+    )
+
+    roman_bengali_words = {
+        # Pronouns
+        "ami",
+        "amar",
+        "amake",
+        "amra",
+        "amader",
+
+        "tumi",
+        "tomar",
+        "tomake",
+        "tomra",
+        "tomader",
+
+        "apni",
+        "apnar",
+        "apnake",
+
+        "se",
+        "she",
+        "tar",
+        "take",
+
+        # Questions
+        "ki",
+        "ke",
+        "kake",
+        "kemon",
+        "keno",
+        "kothay",
+        "kotha",
+        "kokhon",
+        "kivabe",
+        "kirokom",
+
+        # Being
+        "achi",
+        "achho",
+        "acho",
+        "ache",
+        "achen",
+
+        "chilam",
+        "chilo",
+        "chhilo",
+
+        # Doing
+        "korchi",
+        "korcho",
+        "korchen",
+        "korbo",
+        "korbe",
+        "kore",
+        "koro",
+        "korben",
+
+        # Going
+        "jacchi",
+        "jachhi",
+        "jachcho",
+        "jaccho",
+        "jabo",
+        "jabe",
+
+        # Coming
+        "asche",
+        "aschhe",
+        "aschi",
+        "ashchi",
+
+        # Eating
+        "khacchi",
+        "khaccho",
+        "khabo",
+        "kheye",
+
+        # Good / quantity
+        "bhalo",
+        "valo",
+        "valobasha",
+        "bhalobasha",
+        "onek",
+        "khub",
+        "ektu",
+        "sob",
+        "shob",
+        "kichu",
+        "kono",
+
+        # Location / time
+        "ekhane",
+        "okhane",
+        "sekhane",
+        "sekhaney",
+        "aj",
+        "aaj",
+        "kal",
+        "ekhon",
+
+        # Name
+        "naam",
+        "nam",
+
+        # Want / need
+        "hobe",
+        "hoy",
+        "hoye",
+        "hoyeche",
+        "dorkar",
+        "proyojon",
+        "chai",
+        "chao",
+        "chaichi",
+
+        # Commands
+        "dao",
+        "den",
+        "dekh",
+        "dekho",
+        "bolo",
+        "bol",
+        "bolchi",
+        "bolcho",
+
+        # Knowledge
+        "jante",
+        "jani",
+        "janina",
+
+        # Ability
+        "parbo",
+        "pari",
+        "parena",
+
+        # Negative
+        "na",
+        "nei",
+        "noy",
+
+        # Yes
+        "hya",
+        "ha",
+        "haan",
+
+        # Common words
+        "dhonnobad",
+        "bari",
+        "ghor",
+        "bondhu",
+        "ma",
+        "baba",
+        "dada",
+        "didi",
+        "bhai",
+        "bon",
+
+        # Study / work
+        "porashona",
+        "porchi",
+        "porte",
+        "kaj",
+        "chakri",
+
+        # Feelings
+        "bhalo",
+        "kharap",
+        "sundor",
+        "valo",
+    }
+
+    bengali_matches = len(
+        words.intersection(
+            roman_bengali_words
+        )
+    )
+
+    # Strong Bengali words
+    strong_bengali_words = {
+        "ami",
+        "amar",
+        "amake",
+        "tumi",
+        "tomar",
+        "tomake",
+        "kemon",
+        "achi",
+        "achho",
+        "acho",
+        "korchi",
+        "korcho",
+        "bhalo",
+        "valo",
+        "kothay",
+        "kivabe",
+        "keno",
+        "ki",
+        "ekhane",
+        "okhane",
+        "jabo",
+        "jacchi",
+        "asche",
+        "bolchi",
+        "jani",
+        "janina",
+        "naam",
+        "bari",
+        "bondhu",
+    }
+
+    strong_matches = len(
+        words.intersection(
+            strong_bengali_words
+        )
+    )
+
+    # Short Roman Bengali sentences
+    if strong_matches >= 1:
+
+        return "bn"
+
+    if bengali_matches >= 2:
+
+        return "bn"
+
+    # ========================================================
+    # 3. DEFAULT ENGLISH
+    # ========================================================
+
+    return "en"
+
+
+# ============================================================
+# WHISPER MODEL
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def load_whisper():
 
-    model = whisper.load_model(
+    model = WhisperModel(
         WHISPER_MODEL_NAME,
-        download_root="asrmodel"
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=4,
+        num_workers=1,
     )
 
     return model
 
 
 # ============================================================
-# PDF TEXT
-# ============================================================
-
-def extract_pdf_text(file_bytes):
-
-    temp_path = os.path.join(
-        tempfile.gettempdir(),
-        f"pdf_{uuid.uuid4().hex}.pdf"
-    )
-
-    try:
-
-        with open(
-            temp_path,
-            "wb"
-        ) as f:
-
-            f.write(file_bytes)
-
-        reader = PdfReader(temp_path)
-
-        pages = []
-
-        for page in reader.pages:
-
-            try:
-
-                text = page.extract_text()
-
-                if text:
-
-                    pages.append(text)
-
-            except Exception:
-
-                pass
-
-        return "\n\n".join(
-            pages
-        ).strip()
-
-    except Exception:
-
-        return ""
-
-    finally:
-
-        try:
-
-            if os.path.exists(
-                temp_path
-            ):
-
-                os.remove(
-                    temp_path
-                )
-
-        except Exception:
-
-            pass
-
-
-# ============================================================
-# DOCX TEXT
-# ============================================================
-
-def extract_docx_text(file_bytes):
-
-    temp_path = os.path.join(
-        tempfile.gettempdir(),
-        f"docx_{uuid.uuid4().hex}.docx"
-    )
-
-    try:
-
-        with open(
-            temp_path,
-            "wb"
-        ) as f:
-
-            f.write(file_bytes)
-
-        document = Document(temp_path)
-
-        paragraphs = []
-
-        for paragraph in document.paragraphs:
-
-            text = paragraph.text.strip()
-
-            if text:
-
-                paragraphs.append(text)
-
-        return "\n".join(
-            paragraphs
-        ).strip()
-
-    except Exception:
-
-        return ""
-
-    finally:
-
-        try:
-
-            if os.path.exists(
-                temp_path
-            ):
-
-                os.remove(
-                    temp_path
-                )
-
-        except Exception:
-
-            pass
-
-
-# ============================================================
-# ATTACHMENT PROCESSING
-# ============================================================
-
-def process_attachment(uploaded_file):
-
-    if uploaded_file is None:
-
-        return "", None, None
-
-    filename = uploaded_file.name
-
-    file_bytes = uploaded_file.getvalue()
-
-    mime_type = (
-        uploaded_file.type
-        or ""
-    ).lower()
-
-    extension = Path(
-        filename
-    ).suffix.lower()
-
-
-    # ========================================================
-    # IMAGE
-    # ========================================================
-
-    if (
-        mime_type.startswith("image/")
-        or extension in {
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp",
-            ".gif"
-        }
-    ):
-
-        if not mime_type.startswith("image/"):
-
-            mime_type = "image/jpeg"
-
-        image_part = types.Part.from_bytes(
-            data=file_bytes,
-            mime_type=mime_type
-        )
-
-        context = f"""
-IMAGE ATTACHMENT:
-
-Filename:
-{filename}
-
-The image is attached directly to this request.
-
-Analyze the image when the user asks about it.
-"""
-
-        return (
-            context,
-            image_part,
-            None
-        )
-
-
-    # ========================================================
-    # PDF
-    # ========================================================
-
-    if extension == ".pdf":
-
-        extracted_text = extract_pdf_text(
-            file_bytes
-        )
-
-        pdf_part = types.Part.from_bytes(
-            data=file_bytes,
-            mime_type="application/pdf"
-        )
-
-        if extracted_text:
-
-            context = f"""
-PDF ATTACHMENT:
-
-Filename:
-{filename}
-
-Extracted text:
-
-{extracted_text[:120000]}
-
-The original PDF is also attached.
-Use the PDF when useful.
-"""
-
-        else:
-
-            context = f"""
-PDF ATTACHMENT:
-
-Filename:
-{filename}
-
-The PDF contains no easily extractable text.
-
-The original PDF is attached.
-It may be scanned or image-based.
-
-Analyze it if possible.
-"""
-
-        return (
-            context,
-            None,
-            pdf_part
-        )
-
-
-    # ========================================================
-    # DOCX
-    # ========================================================
-
-    if extension == ".docx":
-
-        text = extract_docx_text(
-            file_bytes
-        )
-
-        context = f"""
-DOCX ATTACHMENT:
-
-Filename:
-{filename}
-
-Document content:
-
-{text[:120000]}
-"""
-
-        return (
-            context,
-            None,
-            None
-        )
-
-
-    # ========================================================
-    # TXT / MD / CSV
-    # ========================================================
-
-    if extension in {
-        ".txt",
-        ".md",
-        ".csv"
-    }:
-
-        text = file_bytes.decode(
-            "utf-8",
-            errors="ignore"
-        )
-
-        context = f"""
-TEXT ATTACHMENT:
-
-Filename:
-{filename}
-
-Content:
-
-{text[:120000]}
-"""
-
-        return (
-            context,
-            None,
-            None
-        )
-
-
-    # ========================================================
-    # OTHER
-    # ========================================================
-
-    return (
-        f"Attached file: {filename}",
-        None,
-        None
-    )
-
-
-# ============================================================
-# GEMINI RESPONSE
-# ============================================================
-
-def generate_gemini_response(
-    prompt,
-    image_part=None,
-    file_part=None
-):
-
-    last_error = None
-
-    for attempt in range(4):
-
-        try:
-
-            parts = []
-
-            if image_part is not None:
-
-                parts.append(
-                    image_part
-                )
-
-            if file_part is not None:
-
-                parts.append(
-                    file_part
-                )
-
-            parts.append(
-                types.Part.from_text(
-                    text=prompt
-                )
-            )
-
-            response = client.models.generate_content(
-
-                model=GEMINI_MODEL,
-
-                contents=types.Content(
-
-                    role="user",
-
-                    parts=parts
-                ),
-
-                config=types.GenerateContentConfig(
-
-                    temperature=0.3,
-
-                    max_output_tokens=2048
-                )
-            )
-
-            if response is not None:
-
-                response_text = (
-                    response.text
-                    if response.text
-                    else ""
-                )
-
-                if response_text.strip():
-
-                    return response_text.strip()
-
-            raise RuntimeError(
-                "Gemini returned an empty response."
-            )
-
-
-        except Exception as e:
-
-            last_error = e
-
-            error_text = str(e).upper()
-
-            temporary_error = (
-
-                "503" in error_text
-
-                or "UNAVAILABLE" in error_text
-
-                or "429" in error_text
-
-                or "RESOURCE_EXHAUSTED" in error_text
-
-                or "500" in error_text
-
-                or "502" in error_text
-
-                or "504" in error_text
-            )
-
-            if not temporary_error:
-
-                raise
-
-            if attempt < 3:
-
-                time.sleep(
-                    2 ** attempt
-                )
-
-
-    raise RuntimeError(
-
-        "Gemini is temporarily unavailable.\n\n"
-
-        f"Actual error:\n{last_error}"
-    )
-
-
-# ============================================================
-# LANGUAGE INSTRUCTION
-# ============================================================
-
-def language_instruction(language_code):
-
-    language_name = LANGUAGE_NAMES.get(
-        language_code,
-        language_code
-    )
-
-    return f"""
-LANGUAGE INFORMATION
-
-Detected language:
-{language_name}
-
-Language code:
-{language_code}
-
-IMPORTANT LANGUAGE RULE:
-
-Answer in the SAME language as the user's message.
-
-Do NOT automatically translate the answer into English.
-
-Examples:
-
-Bengali user → Bengali answer.
-
-Hindi user → Hindi answer.
-
-English user → English answer.
-
-Odia user → Odia answer.
-
-Tamil user → Tamil answer.
-
-Telugu user → Telugu answer.
-
-Nepali user → Nepali answer.
-
-Gujarati user → Gujarati answer.
-
-Assamese user → Assamese answer.
-
-If the user mixes languages,
-use the dominant language naturally.
-
-For normal text chat, detect the user's language
-from the actual message itself.
-"""
-
-
-# ============================================================
-# BUILD CONVERSATION HISTORY
-# ============================================================
-
-def build_history():
-
-    history = ""
-
-    recent_messages = (
-        st.session_state.messages[-12:]
-    )
-
-    for message in recent_messages:
-
-        role = message.get(
-            "role",
-            "user"
-        )
-
-        content = message.get(
-            "content",
-            ""
-        )
-
-        if content:
-
-            history += (
-                f"{role.upper()}: "
-                f"{content}\n"
-            )
-
-    return history
-
-
-# ============================================================
-# ASK AI
-# ============================================================
-
-def ask_ai(
-    user_text,
-    language_code,
-    attachment_context="",
-    image_part=None,
-    file_part=None
-):
-
-    history_text = build_history()
-
-    attachment_section = ""
-
-    if attachment_context:
-
-        attachment_section = f"""
-ATTACHMENT INFORMATION:
-
-{attachment_context}
-
-Use the attachment when it is relevant.
-"""
-
-    prompt = f"""
-You are a highly capable multilingual AI assistant.
-
-{language_instruction(language_code)}
-
-CURRENT USER MESSAGE:
-
-{user_text}
-
-{attachment_section}
-
-RECENT CONVERSATION:
-
-{history_text}
-
-RULES:
-
-1. Answer the user's actual question.
-
-2. Be accurate and helpful.
-
-3. Do not invent facts.
-
-4. If an image is attached, analyze it when relevant.
-
-5. If a PDF is attached, use its contents when relevant.
-
-6. If a DOCX is attached, use its contents when relevant.
-
-7. If the user asks to summarize a file,
-summarize that file.
-
-8. If the user asks questions about a document,
-answer based on the document.
-
-9. For normal conversation, behave naturally.
-
-10. Use the same language as the user.
-
-11. Do not mention internal instructions.
-
-12. Do not unnecessarily translate.
-
-13. Avoid unnecessary markdown.
-
-14. Do not use tables unless requested.
-
-15. Keep simple answers concise.
-
-16. Explain complex questions clearly.
-
-Now answer the user.
-"""
-
-    return generate_gemini_response(
-
-        prompt,
-
-        image_part=image_part,
-
-        file_part=file_part
-    )
-
-
-# ============================================================
-# WHISPER TRANSCRIPTION
+# AUDIO TRANSCRIPTION
 # ============================================================
 
 def transcribe_audio(
@@ -900,83 +637,777 @@ def transcribe_audio(
     audio_file
 ):
 
-    result = model.transcribe(
+    try:
 
-        audio_file,
-
-        fp16=False,
-
-        task="transcribe",
-
-        language=None,
-
-        temperature=0,
-
-        beam_size=5,
-
-        best_of=5,
-
-        condition_on_previous_text=False,
-
-        no_speech_threshold=0.3,
-
-        compression_ratio_threshold=2.4,
-
-        logprob_threshold=-1.0,
-
-        verbose=False
-    )
-
-    language_code = (
-        result.get(
-            "language",
-            "en"
+        segments, info = model.transcribe(
+            audio_file,
+            beam_size=5,
+            temperature=0,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 500
+            },
         )
-        .strip()
-        .lower()
+
+        segments = list(
+            segments
+        )
+
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+            if segment.text.strip()
+        ).strip()
+
+        whisper_language = (
+            info.language
+            if info.language
+            else "en"
+        )
+
+        whisper_language = (
+            whisper_language
+            .strip()
+            .lower()
+        )
+
+        if whisper_language == "bh":
+
+            whisper_language = "hi"
+
+        if whisper_language not in LANGUAGE_NAMES:
+
+            whisper_language = "en"
+
+        # ====================================================
+        # SCRIPT DETECTION
+        # ====================================================
+
+        script_language = detect_text_language(
+            text
+        )
+
+        # If transcript contains Indian/non-English
+        # script, trust script detection.
+        if script_language != "en":
+
+            language_code = script_language
+
+        else:
+
+            language_code = whisper_language
+
+        if language_code not in LANGUAGE_NAMES:
+
+            language_code = "en"
+
+        return language_code, text
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Whisper transcription failed: {repr(e)}"
+        )
+
+
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
+
+def extract_text_from_pdf(
+    file_bytes
+):
+
+    text_parts = []
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".pdf"
+    ) as tmp:
+
+        tmp.write(file_bytes)
+
+        tmp_path = tmp.name
+
+    try:
+
+        reader = PdfReader(
+            tmp_path
+        )
+
+        for page in reader.pages:
+
+            page_text = page.extract_text()
+
+            if page_text:
+
+                text_parts.append(
+                    page_text
+                )
+
+    finally:
+
+        try:
+
+            os.remove(
+                tmp_path
+            )
+
+        except Exception:
+            pass
+
+    return "\n".join(
+        text_parts
+    ).strip()
+
+
+# ============================================================
+# DOCX TEXT EXTRACTION
+# ============================================================
+
+def extract_text_from_docx(
+    file_bytes
+):
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".docx"
+    ) as tmp:
+
+        tmp.write(file_bytes)
+
+        tmp_path = tmp.name
+
+    try:
+
+        document = Document(
+            tmp_path
+        )
+
+        paragraphs = [
+            paragraph.text
+            for paragraph in document.paragraphs
+            if paragraph.text.strip()
+        ]
+
+        return "\n".join(
+            paragraphs
+        ).strip()
+
+    finally:
+
+        try:
+
+            os.remove(
+                tmp_path
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# FILE PROCESSING
+# ============================================================
+
+def process_uploaded_file(
+    uploaded_file
+):
+
+    if uploaded_file is None:
+
+        return "", None, None
+
+    filename = uploaded_file.name
+
+    extension = Path(
+        filename
+    ).suffix.lower()
+
+    file_bytes = uploaded_file.getvalue()
+
+    # ========================================================
+    # PDF
+    # ========================================================
+
+    if extension == ".pdf":
+
+        text = extract_text_from_pdf(
+            file_bytes
+        )
+
+        file_part = types.Part.from_bytes(
+            data=file_bytes,
+            mime_type="application/pdf"
+        )
+
+        return text, None, file_part
+
+    # ========================================================
+    # DOCX
+    # ========================================================
+
+    if extension == ".docx":
+
+        text = extract_text_from_docx(
+            file_bytes
+        )
+
+        file_part = types.Part.from_bytes(
+            data=file_bytes,
+            mime_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            )
+        )
+
+        return text, None, file_part
+
+    # ========================================================
+    # TXT / MD / CSV
+    # ========================================================
+
+    if extension in [
+        ".txt",
+        ".md",
+        ".csv"
+    ]:
+
+        try:
+
+            text = file_bytes.decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+        except Exception:
+
+            text = ""
+
+        return text.strip(), None, None
+
+    # ========================================================
+    # IMAGES
+    # ========================================================
+
+    image_extensions = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }
+
+    if extension in image_extensions:
+
+        mime_type = image_extensions[
+            extension
+        ]
+
+        image_part = types.Part.from_bytes(
+            data=file_bytes,
+            mime_type=mime_type
+        )
+
+        return "", image_part, None
+
+    return "", None, None
+
+
+# ============================================================
+# LANGUAGE INSTRUCTION
+# ============================================================
+
+def get_language_instruction(
+    language_code
+):
+
+    language_name = LANGUAGE_NAMES.get(
+        language_code,
+        "English"
     )
 
-    text = (
-        result.get(
-            "text",
+    instruction = f"""
+IMPORTANT LANGUAGE RULE:
+
+The user's language is {language_name}.
+
+You MUST reply ONLY in {language_name}.
+
+The response language MUST match the user's language.
+
+If the user speaks or writes Bengali,
+answer completely in Bengali.
+
+If the user speaks or writes Romanized Bengali,
+understand it as Bengali and answer completely in Bengali.
+
+If the user speaks or writes Hindi,
+answer completely in Hindi.
+
+If the user speaks or writes English,
+answer completely in English.
+
+If the user speaks or writes Odia,
+answer completely in Odia.
+
+If the user speaks or writes Tamil,
+answer completely in Tamil.
+
+If the user speaks or writes Telugu,
+answer completely in Telugu.
+
+If the user speaks or writes Kannada,
+answer completely in Kannada.
+
+If the user speaks or writes Malayalam,
+answer completely in Malayalam.
+
+If the user speaks or writes Gujarati,
+answer completely in Gujarati.
+
+If the user speaks or writes Punjabi,
+answer completely in Punjabi.
+
+Do NOT translate the user's question into English
+unless explicitly requested.
+
+Do NOT switch to English unnecessarily.
+
+Do NOT mix languages unnecessarily.
+
+The final answer must remain in {language_name}.
+
+Use natural conversational language suitable for voice output.
+"""
+
+    return instruction
+
+
+# ============================================================
+# BUILD CHAT HISTORY
+# ============================================================
+
+def build_history():
+
+    recent_messages = (
+        st.session_state.messages[-12:]
+    )
+
+    history = []
+
+    for message in recent_messages:
+
+        role = message.get(
+            "role",
             ""
         )
-        .strip()
-    )
 
-    # Whisper does not have a separate
-    # Bihari language model/code.
-    if language_code == "bh":
+        content = message.get(
+            "content",
+            ""
+        )
 
-        language_code = "hi"
+        if not content:
 
-    return (
-        language_code,
-        text
+            continue
+
+        if role == "user":
+
+            history.append(
+                f"User: {content}"
+            )
+
+        elif role == "assistant":
+
+            history.append(
+                f"Assistant: {content}"
+            )
+
+    return "\n".join(
+        history
     )
 
 
 # ============================================================
-# TTS
+# GEMINI SINGLE REQUEST
+# ============================================================
+
+def generate_with_model(
+    model_name,
+    prompt,
+    image_part=None,
+    file_part=None,
+):
+
+    contents = []
+
+    if image_part is not None:
+
+        contents.append(
+            image_part
+        )
+
+    if file_part is not None:
+
+        contents.append(
+            file_part
+        )
+
+    contents.append(
+        prompt
+    )
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=contents,
+    )
+
+    if response is None:
+
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
+
+    text = getattr(
+        response,
+        "text",
+        None
+    )
+
+    if not text:
+
+        raise RuntimeError(
+            "Gemini returned no text response."
+        )
+
+    return text.strip()
+
+
+# ============================================================
+# RETRYABLE GEMINI ERROR
+# ============================================================
+
+def is_retryable_gemini_error(
+    error
+):
+
+    error_text = str(
+        error
+    ).upper()
+
+    retry_codes = [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "INTERNAL",
+        "BAD_GATEWAY",
+        "DEADLINE",
+        "TIMEOUT",
+    ]
+
+    return any(
+        code in error_text
+        for code in retry_codes
+    )
+
+
+# ============================================================
+# GEMINI REQUEST WITH RETRY + FALLBACK
+# ============================================================
+
+def ask_gemini(
+    prompt,
+    image_part=None,
+    file_part=None,
+):
+
+    models_to_try = [
+        GEMINI_MODEL
+    ]
+
+    for fallback in FALLBACK_MODELS:
+
+        if fallback not in models_to_try:
+
+            models_to_try.append(
+                fallback
+            )
+
+    last_error = None
+
+    for model_index, model_name in enumerate(
+        models_to_try
+    ):
+
+        max_attempts = (
+            3
+            if model_index == 0
+            else 2
+        )
+
+        for attempt in range(
+            max_attempts
+        ):
+
+            try:
+
+                if (
+                    model_index > 0
+                    and attempt == 0
+                ):
+
+                    st.info(
+                        f"🔄 {GEMINI_MODEL} is temporarily busy. "
+                        f"Trying fallback model: {model_name}"
+                    )
+
+                result = generate_with_model(
+                    model_name=model_name,
+                    prompt=prompt,
+                    image_part=image_part,
+                    file_part=file_part,
+                )
+
+                if result:
+
+                    return result
+
+            except Exception as e:
+
+                last_error = e
+
+                print(
+                    f"Gemini error | "
+                    f"model={model_name} | "
+                    f"attempt={attempt + 1} | "
+                    f"error={repr(e)}"
+                )
+
+                if not is_retryable_gemini_error(
+                    e
+                ):
+
+                    raise RuntimeError(
+                        f"Gemini API error: {e}"
+                    )
+
+                if attempt < max_attempts - 1:
+
+                    delay = 5 * (
+                        2 ** attempt
+                    )
+
+                    delay = min(
+                        delay,
+                        20
+                    )
+
+                    time.sleep(
+                        delay
+                    )
+
+    raise RuntimeError(
+        "Gemini API is temporarily unavailable. "
+        "The primary model and fallback models "
+        "all failed.\n\n"
+        f"Last error: {last_error}"
+    )
+
+
+# ============================================================
+# ASK AI
+# ============================================================
+
+def ask_ai(
+    user_message,
+    language_code,
+    image_part=None,
+    file_part=None,
+    uploaded_context="",
+):
+
+    language_name = LANGUAGE_NAMES.get(
+        language_code,
+        "English"
+    )
+
+    language_instruction = (
+        get_language_instruction(
+            language_code
+        )
+    )
+
+    history = build_history()
+
+    attachment_instruction = ""
+
+    # ========================================================
+    # UPLOADED TEXT
+    # ========================================================
+
+    if uploaded_context:
+
+        attachment_instruction = f"""
+The user uploaded a file.
+
+Here is extracted text from the file:
+
+---------------- FILE CONTENT ----------------
+
+{uploaded_context}
+
+---------------- END FILE CONTENT ------------
+
+Use this content when answering the user's question.
+
+Do not ignore relevant information from the uploaded file.
+"""
+
+    # ========================================================
+    # IMAGE
+    # ========================================================
+
+    if image_part is not None:
+
+        attachment_instruction += """
+An image has also been attached.
+
+Analyze the image carefully and answer based on
+the visible content.
+"""
+
+    # ========================================================
+    # DOCUMENT
+    # ========================================================
+
+    if file_part is not None:
+
+        attachment_instruction += """
+A document has also been attached.
+
+Use the document as supporting context when relevant.
+"""
+
+    # ========================================================
+    # PROMPT
+    # ========================================================
+
+    prompt = f"""
+You are a helpful multilingual AI voice assistant.
+
+{language_instruction}
+
+GENERAL RULES:
+
+1. Give accurate and useful answers.
+
+2. Understand conversational questions.
+
+3. Be polite and natural.
+
+4. Do not mention internal API errors unless necessary.
+
+5. Do not say that you are unable to understand the user
+   unless the input is genuinely unclear.
+
+6. If the user asks a technical question,
+   explain clearly.
+
+7. If the user asks for code,
+   provide complete working code when appropriate.
+
+8. Keep answers reasonably concise unless the user
+   requests a detailed explanation.
+
+9. Preserve the user's language exactly.
+
+10. Do not unnecessarily change language.
+
+11. The final response MUST be written in
+    the detected user language.
+
+12. Never switch to English just because the question
+    contains some English words.
+
+13. If the user uses Bengali script,
+    respond in Bengali.
+
+14. If the user uses Romanized Bengali,
+    treat it as Bengali and respond in Bengali.
+
+15. If the user uses Hindi / Devanagari script,
+    respond in Hindi.
+
+16. Use natural conversational language suitable
+    for voice output.
+
+17. Do not translate unless the user asks for translation.
+
+18. Make the response easy to listen to using TTS.
+
+RECENT CONVERSATION:
+
+{history}
+
+{attachment_instruction}
+
+CURRENT USER MESSAGE:
+
+{user_message}
+
+FINAL INSTRUCTION:
+
+Answer the user in {language_name}.
+
+Do not change the response language.
+
+If the user's input is Romanized Bengali,
+the final answer must be Bengali.
+"""
+
+    return ask_gemini(
+        prompt=prompt,
+        image_part=image_part,
+        file_part=file_part,
+    )
+
+
+# ============================================================
+# TEXT TO SPEECH
 # ============================================================
 
 async def generate_tts(
     text,
-    voice,
-    output_file
+    language_code,
+    output_file,
 ):
 
+    if language_code not in TTS_VOICES:
+
+        language_code = "en"
+
+    voice = TTS_VOICES.get(
+        language_code,
+        TTS_VOICES["en"]
+    )
+
+    print(
+        f"TTS language: {language_code}"
+    )
+
+    print(
+        f"TTS voice: {voice}"
+    )
+
     communicate = edge_tts.Communicate(
-
-        text=text,
-
-        voice=voice,
-
-        rate="+0%",
-
-        volume="+0%",
-
-        pitch="+0Hz"
+        text,
+        voice
     )
 
     await communicate.save(
@@ -984,118 +1415,54 @@ async def generate_tts(
     )
 
 
-def create_voice(
+def text_to_speech(
     text,
-    language_code
+    language_code,
 ):
 
     if not text:
 
         return None
 
-    voice = TTS_VOICES.get(
-        language_code
-    )
+    if language_code not in TTS_VOICES:
 
-    # Hindi fallback
-    if not voice:
-
-        voice = TTS_VOICES.get(
-            "hi"
-        )
+        language_code = "en"
 
     output_file = os.path.join(
-
         tempfile.gettempdir(),
-
         f"tts_{uuid.uuid4().hex}.mp3"
     )
 
     try:
 
         asyncio.run(
-
             generate_tts(
-
                 text,
-
-                voice,
-
-                output_file
+                language_code,
+                output_file,
             )
         )
 
-        if not os.path.exists(
+        if os.path.exists(
             output_file
         ):
 
-            return None
+            return output_file
 
-        with open(
-            output_file,
-            "rb"
-        ) as f:
+    except Exception as e:
 
-            return f.read()
+        print(
+            f"TTS error: {repr(e)}"
+        )
 
-    except Exception:
-
-        return None
-
-    finally:
-
-        try:
-
-            if os.path.exists(
-                output_file
-            ):
-
-                os.remove(
-                    output_file
-                )
-
-        except Exception:
-
-            pass
+    return None
 
 
 # ============================================================
 # NEW CHAT
 # ============================================================
 
-def new_chat():
-
-    if st.session_state.messages:
-
-        first_user_message = next(
-
-            (
-                m["content"]
-
-                for m in st.session_state.messages
-
-                if m["role"] == "user"
-            ),
-
-            "New conversation"
-        )
-
-        title = (
-
-            first_user_message[:50]
-
-            .replace(
-                "\n",
-                " "
-            )
-        )
-
-        if title:
-
-            st.session_state.conversation_titles.append(
-                title
-            )
-
+def start_new_chat():
 
     st.session_state.messages = []
 
@@ -1115,326 +1482,130 @@ def new_chat():
 
 
 # ============================================================
-# SIDEBAR
-# ============================================================
-
-def render_sidebar():
-
-    with st.sidebar:
-
-        st.markdown(
-            "# 🎙️ AI Assistant"
-        )
-
-        st.caption(
-            f"Gemini: {GEMINI_MODEL}"
-        )
-
-        if st.button(
-            "➕ New Chat",
-            use_container_width=True
-        ):
-
-            new_chat()
-
-            st.rerun()
-
-        st.divider()
-
-        # ====================================================
-        # SEARCH
-        # ====================================================
-
-        st.markdown(
-            "### 🔎 Search History"
-        )
-
-        search = st.text_input(
-
-            "Search",
-
-            placeholder="Search conversations..."
-        )
-
-        st.markdown(
-            "### 🕘 Conversations"
-        )
-
-        titles = (
-            st.session_state.conversation_titles
-        )
-
-        if search:
-
-            titles = [
-
-                title
-
-                for title in titles
-
-                if search.lower()
-                in title.lower()
-            ]
-
-        if titles:
-
-            for title in reversed(titles):
-
-                st.caption(
-                    f"💬 {title}"
-                )
-
-        else:
-
-            st.caption(
-                "No saved conversations yet."
-            )
-
-        st.divider()
-
-        st.markdown(
-            "### 🌍 Languages"
-        )
-
-        st.caption(
-            """
-English
-Hindi
-Bengali
-Odia
-Tamil
-Telugu
-Nepali
-Gujarati
-Assamese
-Marathi
-Kannada
-Malayalam
-Punjabi
-Urdu
-French
-German
-Spanish
-Italian
-Portuguese
-Japanese
-Korean
-Chinese
-Russian
-Arabic
-and more.
-"""
-        )
-
-        st.divider()
-
-        if st.button(
-            "🗑️ Clear Session History",
-            use_container_width=True
-        ):
-
-            st.session_state.messages = []
-
-            st.session_state.conversation_titles = []
-
-            st.session_state.pending_transcript = ""
-
-            st.rerun()
-
-
-# ============================================================
-# DISPLAY MESSAGE
-# ============================================================
-
-def display_message(message):
-
-    role = message.get(
-        "role"
-    )
-
-    content = message.get(
-        "content",
-        ""
-    )
-
-    with st.chat_message(
-        role
-    ):
-
-        st.markdown(
-            content
-        )
-
-        if message.get(
-            "audio"
-        ):
-
-            st.audio(
-
-                message["audio"],
-
-                format="audio/mp3"
-            )
-
-        if message.get(
-            "file_name"
-        ):
-
-            st.caption(
-                f"📎 {message['file_name']}"
-            )
-
-
-# ============================================================
 # PROCESS USER MESSAGE
 # ============================================================
 
 def process_user_message(
-    user_text,
-    language_code
+    user_message,
+    language_code,
 ):
 
-    attachment_context = (
-        st.session_state.get(
-            "uploaded_context",
-            ""
-        )
+    if not user_message:
+
+        return
+
+    user_message = user_message.strip()
+
+    if not user_message:
+
+        return
+
+    if language_code not in LANGUAGE_NAMES:
+
+        language_code = "en"
+
+    language_name = LANGUAGE_NAMES.get(
+        language_code,
+        "English"
     )
 
-    attachment_filename = (
-        st.session_state.get(
-            "uploaded_filename",
-            ""
-        )
+    print(
+        f"Processing message | "
+        f"language={language_code} | "
+        f"language_name={language_name}"
     )
 
-    image_part = (
-        st.session_state.get(
-            "image_part",
-            None
-        )
+    # ========================================================
+    # ADD USER MESSAGE
+    # ========================================================
+
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": user_message,
+        }
     )
 
-    file_part = (
-        st.session_state.get(
-            "file_part",
-            None
-        )
-    )
-
-
     # ========================================================
-    # USER MESSAGE
+    # GEMINI
     # ========================================================
 
-    st.session_state.messages.append({
+    try:
 
-        "role": "user",
+        with st.spinner(
+            "🤖 Thinking..."
+        ):
 
-        "content": user_text,
-
-        "file_name": attachment_filename
-    })
-
-
-    # ========================================================
-    # AI
-    # ========================================================
-
-    with st.spinner(
-        "🤖 Gemini is thinking..."
-    ):
-
-        try:
-
-            answer = ask_ai(
-
-                user_text,
-
-                language_code,
-
-                attachment_context,
-
-                image_part,
-
-                file_part
+            response = ask_ai(
+                user_message=user_message,
+                language_code=language_code,
+                image_part=(
+                    st.session_state.image_part
+                ),
+                file_part=(
+                    st.session_state.file_part
+                ),
+                uploaded_context=(
+                    st.session_state.uploaded_context
+                ),
             )
 
-        except Exception as e:
+    except Exception as e:
 
-            error_text = str(e)
+        error_message = str(
+            e
+        )
 
-            if (
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    "Sorry, I could not process your request.\n\n"
+                    f"Error: {error_message}"
+                ),
+            }
+        )
 
-                "503" in error_text
+        st.error(
+            "❌ Gemini request failed. "
+            "Please try again."
+        )
 
-                or
-                "UNAVAILABLE" in error_text
-            ):
+        return
 
-                answer = (
+    # ========================================================
+    # ASSISTANT RESPONSE
+    # ========================================================
 
-                    "Gemini is temporarily busy. "
-                    "Please try again in a few seconds."
-                )
-
-            elif (
-
-                "429" in error_text
-
-                or
-                "RESOURCE_EXHAUSTED"
-                in error_text
-            ):
-
-                answer = (
-
-                    "Gemini request limit was reached. "
-                    "Please wait a little and try again."
-                )
-
-            else:
-
-                answer = (
-
-                    "Sorry, I could not process "
-                    "your request.\n\n"
-
-                    f"Error: {error_text}"
-                )
-
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": response,
+        }
+    )
 
     # ========================================================
     # TTS
     # ========================================================
 
-    audio_bytes = None
-
     with st.spinner(
         "🔊 Generating voice..."
     ):
 
-        audio_bytes = create_voice(
-
-            answer,
-
-            language_code
+        audio_file = text_to_speech(
+            response,
+            language_code,
         )
 
+    if audio_file:
 
-    # ========================================================
-    # ASSISTANT MESSAGE
-    # ========================================================
+        st.session_state.messages[-1][
+            "audio_file"
+        ] = audio_file
 
-    st.session_state.messages.append({
-
-        "role": "assistant",
-
-        "content": answer,
-
-        "audio": audio_bytes
-    })
-
+        st.session_state.messages[-1][
+            "tts_language"
+        ] = language_code
 
     # ========================================================
     # CLEAR ATTACHMENT
@@ -1450,13 +1621,203 @@ def process_user_message(
 
 
 # ============================================================
-# MAIN
+# RENDER CHAT MESSAGES
+# ============================================================
+
+def render_messages():
+
+    for message in st.session_state.messages:
+
+        role = message.get(
+            "role",
+            "assistant"
+        )
+
+        content = message.get(
+            "content",
+            ""
+        )
+
+        with st.chat_message(
+            role
+        ):
+
+            st.markdown(
+                content
+            )
+
+            audio_file = message.get(
+                "audio_file"
+            )
+
+            if (
+                role == "assistant"
+                and audio_file
+                and os.path.exists(audio_file)
+            ):
+
+                try:
+
+                    with open(
+                        audio_file,
+                        "rb"
+                    ) as audio:
+
+                        st.audio(
+                            audio.read(),
+                            format="audio/mp3"
+                        )
+
+                except Exception:
+
+                    pass
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+def render_sidebar():
+
+    with st.sidebar:
+
+        st.title(
+            "🎙️ AI Voice Assistant"
+        )
+
+        st.caption(
+            "Multilingual AI voice assistant"
+        )
+
+        st.divider()
+
+        # ====================================================
+        # NEW CHAT
+        # ====================================================
+
+        if st.button(
+            "🆕 New Chat",
+            use_container_width=True
+        ):
+
+            start_new_chat()
+
+            st.rerun()
+
+        st.divider()
+
+        # ====================================================
+        # SEARCH
+        # ====================================================
+
+        st.subheader(
+            "🔎 Search Chat"
+        )
+
+        search_text = st.text_input(
+            "Search messages",
+            placeholder="Type to search..."
+        )
+
+        if search_text:
+
+            search_text_lower = (
+                search_text.lower()
+            )
+
+            found = False
+
+            for message in st.session_state.messages:
+
+                content = message.get(
+                    "content",
+                    ""
+                )
+
+                if (
+                    search_text_lower
+                    in content.lower()
+                ):
+
+                    found = True
+
+                    st.write(
+                        content[:200]
+                    )
+
+            if not found:
+
+                st.caption(
+                    "No matching message found."
+                )
+
+        st.divider()
+
+        # ====================================================
+        # LANGUAGES
+        # ====================================================
+
+        st.subheader(
+            "🌍 Supported Languages"
+        )
+
+        language_count = len(
+            LANGUAGE_NAMES
+        )
+
+        st.caption(
+            f"{language_count} languages supported"
+        )
+
+        language_display = [
+            f"{code.upper()} — {name}"
+            for code, name
+            in LANGUAGE_NAMES.items()
+        ]
+
+        with st.expander(
+            "View languages"
+        ):
+
+            for language in language_display:
+
+                st.write(
+                    f"• {language}"
+                )
+
+        st.divider()
+
+        # ====================================================
+        # CLEAR HISTORY
+        # ====================================================
+
+        if st.button(
+            "🗑️ Clear Chat History",
+            use_container_width=True
+        ):
+
+            st.session_state.messages = []
+
+            st.rerun()
+
+        st.divider()
+
+        st.caption(
+            f"Whisper model: {WHISPER_MODEL_NAME}"
+        )
+
+        st.caption(
+            f"Gemini model: {GEMINI_MODEL}"
+        )
+
+
+# ============================================================
+# MAIN APP
 # ============================================================
 
 def main():
 
     render_sidebar()
-
 
     # ========================================================
     # HEADER
@@ -1466,94 +1827,33 @@ def main():
         "🎙️ Multilingual AI Voice Assistant"
     )
 
-    st.caption(
-        "Voice • Chat • Image • PDF • DOCX • AI • TTS"
-    )
-
-
-    # ========================================================
-    # IMPORTANT
-    # ========================================================
-    # Whisper is intentionally NOT loaded here.
-    #
-    # It will only load when the user clicks
-    # "Transcribe Voice".
-    #
-    # This prevents the 1.42 GB medium model from
-    # loading during normal application startup.
-    # ========================================================
-
-
-    # ========================================================
-    # SHOW CHAT HISTORY
-    # ========================================================
-
-    for message in st.session_state.messages:
-
-        display_message(
-            message
-        )
-
-
-    # ========================================================
-    # FILE ATTACHMENT
-    # ========================================================
-
     st.markdown(
-        "### 📎 Attach File"
+        "Speak naturally in your language and get an AI response."
     )
+
+    st.divider()
+
+    # ========================================================
+    # FILE UPLOAD
+    # ========================================================
 
     uploaded_file = st.file_uploader(
-
-        "PDF, DOCX, TXT, CSV, JPG, PNG, WEBP",
-
+        "📎 Upload a file or image",
         type=[
-
             "pdf",
             "docx",
             "txt",
             "md",
             "csv",
-
             "jpg",
             "jpeg",
             "png",
             "webp",
-            "gif"
+            "gif",
         ],
-
-        key="main_file_uploader"
     )
 
-
     if uploaded_file is not None:
-
-        st.success(
-            f"📎 {uploaded_file.name}"
-        )
-
-
-        # ====================================================
-        # IMAGE PREVIEW
-        # ====================================================
-
-        if uploaded_file.type.startswith(
-            "image/"
-        ):
-
-            st.image(
-
-                uploaded_file,
-
-                caption=uploaded_file.name,
-
-                use_container_width=True
-            )
-
-
-        # ====================================================
-        # PROCESS FILE
-        # ====================================================
 
         if (
             st.session_state.uploaded_filename
@@ -1562,242 +1862,264 @@ def main():
 
             try:
 
-                context, image_part, file_part = (
-                    process_attachment(
+                with st.spinner(
+                    "📄 Processing uploaded file..."
+                ):
+
+                    (
+                        extracted_text,
+                        image_part,
+                        file_part,
+                    ) = process_uploaded_file(
                         uploaded_file
                     )
-                )
 
-                st.session_state.uploaded_context = (
-                    context
-                )
+                    st.session_state.uploaded_context = (
+                        extracted_text
+                    )
 
-                st.session_state.uploaded_filename = (
-                    uploaded_file.name
-                )
+                    st.session_state.uploaded_filename = (
+                        uploaded_file.name
+                    )
 
-                st.session_state.image_part = (
-                    image_part
-                )
+                    st.session_state.image_part = (
+                        image_part
+                    )
 
-                st.session_state.file_part = (
-                    file_part
+                    st.session_state.file_part = (
+                        file_part
+                    )
+
+                st.success(
+                    f"✅ {uploaded_file.name} "
+                    "uploaded successfully."
                 )
 
             except Exception as e:
 
                 st.error(
-                    f"❌ File processing error: {e}"
+                    f"❌ File processing failed: {e}"
                 )
 
-
         # ====================================================
-        # REMOVE FILE
+        # IMAGE PREVIEW
         # ====================================================
 
-        if st.button(
-            "✕ Remove attachment"
-        ):
+        extension = Path(
+            uploaded_file.name
+        ).suffix.lower()
 
-            st.session_state.uploaded_context = ""
+        if extension in [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".gif",
+        ]:
 
-            st.session_state.uploaded_filename = ""
-
-            st.session_state.image_part = None
-
-            st.session_state.file_part = None
-
-            st.rerun()
-
-
-    # ========================================================
-    # VOICE INPUT
-    # ========================================================
-
-    st.markdown(
-        "### 🎤 Voice Input"
-    )
-
-    audio = st.audio_input(
-
-        "Click microphone and speak",
-
-        sample_rate=16000,
-
-        key=(
-            "voice_"
-            + str(
-                st.session_state.recorder_key
+            st.image(
+                uploaded_file,
+                caption=uploaded_file.name,
+                use_container_width=True,
             )
-        )
+
+        # ====================================================
+        # TEXT PREVIEW
+        # ====================================================
+
+        if st.session_state.uploaded_context:
+
+            with st.expander(
+                "📄 View extracted file text"
+            ):
+
+                preview_text = (
+                    st.session_state.uploaded_context
+                )
+
+                if len(preview_text) > 5000:
+
+                    preview_text = (
+                        preview_text[:5000]
+                        + "\n\n...[truncated]"
+                    )
+
+                st.text_area(
+                    "Extracted content",
+                    preview_text,
+                    height=250,
+                    disabled=True,
+                )
+
+    # ========================================================
+    # EXISTING CHAT
+    # ========================================================
+
+    render_messages()
+
+    # ========================================================
+    # MICROPHONE
+    # ========================================================
+
+    st.subheader(
+        "🎤 Voice Input"
     )
 
+    recorder_key = (
+        f"recorder_{st.session_state.recorder_key}"
+    )
 
-    if audio is not None:
+    audio_value = st.audio_input(
+        "Click microphone and speak",
+        sample_rate=16000,
+        key=recorder_key,
+    )
 
-        st.audio(
-            audio
-        )
-
+    if audio_value is not None:
 
         if st.button(
             "📝 Transcribe Voice",
             use_container_width=True
         ):
 
-            temp_audio = None
-
             try:
 
-                # ====================================================
-                # LOAD WHISPER ONLY NOW
-                # ====================================================
+                # =================================================
+                # LOAD WHISPER
+                # =================================================
+
+                whisper_spinner_text = (
+                    f"⏳ Loading Whisper "
+                    f"{WHISPER_MODEL_NAME} "
+                    "(CPU INT8)..."
+                )
 
                 with st.spinner(
-                    f"⏳ Loading Whisper {WHISPER_MODEL_NAME}..."
+                    whisper_spinner_text
                 ):
 
                     whisper_model = load_whisper()
 
+                # =================================================
+                # TEMP AUDIO
+                # =================================================
 
-                # ====================================================
-                # SAVE AUDIO TEMPORARILY
-                # ====================================================
-
-                temp_audio = os.path.join(
-
+                audio_path = os.path.join(
                     tempfile.gettempdir(),
-
                     f"voice_{uuid.uuid4().hex}.wav"
                 )
 
-
                 with open(
-                    temp_audio,
+                    audio_path,
                     "wb"
-                ) as f:
+                ) as audio_file:
 
-                    f.write(
-                        audio.getbuffer()
+                    audio_file.write(
+                        audio_value.getvalue()
                     )
 
-
-                # ====================================================
-                # TRANSCRIBE
-                # ====================================================
+                # =================================================
+                # TRANSCRIPTION
+                # =================================================
 
                 with st.spinner(
-                    "🌍 Detecting language and transcribing..."
+                    "🎧 Transcribing..."
                 ):
 
-                    language_code, text = (
-                        transcribe_audio(
-
-                            whisper_model,
-
-                            temp_audio
-                        )
+                    (
+                        language_code,
+                        transcript,
+                    ) = transcribe_audio(
+                        whisper_model,
+                        audio_path,
                     )
 
+                # =================================================
+                # DELETE TEMP AUDIO
+                # =================================================
 
-                if not text:
+                try:
+
+                    os.remove(
+                        audio_path
+                    )
+
+                except Exception:
+
+                    pass
+
+                if not transcript:
 
                     st.warning(
-                        "❌ No speech detected."
+                        "⚠️ No speech detected. "
+                        "Please record again."
                     )
 
                 else:
 
-                    # ========================================
-                    # SHOW TRANSCRIPT
-                    # ========================================
-
                     st.session_state.pending_transcript = (
-                        text
+                        transcript
                     )
 
                     st.session_state.pending_language = (
                         language_code
                     )
 
-                    st.success(
-
-                        "Detected language: "
-
-                        +
-
+                    detected_name = (
                         LANGUAGE_NAMES.get(
-
                             language_code,
-
                             language_code
                         )
                     )
 
+                    st.success(
+                        f"Detected language: {detected_name}"
+                    )
+
+                    print(
+                        f"Whisper/script detected language: "
+                        f"{language_code}"
+                    )
+
+                    print(
+                        f"Transcript: {transcript}"
+                    )
 
             except Exception as e:
 
                 st.error(
-                    f"❌ Voice processing error: {e}"
+                    f"❌ Transcription failed: {e}"
                 )
 
-
-            finally:
-
-                try:
-
-                    if (
-
-                        temp_audio
-
-                        and
-
-                        os.path.exists(
-                            temp_audio
-                        )
-                    ):
-
-                        os.remove(
-                            temp_audio
-                        )
-
-                except Exception:
-
-                    pass
-
-
     # ========================================================
-    # TRANSCRIPT EDIT
+    # TRANSCRIPT
     # ========================================================
 
     if st.session_state.pending_transcript:
 
-        st.markdown(
-            "### 📝 Your Voice Transcript"
+        st.subheader(
+            "📝 Transcribed Text"
+        )
+
+        edited_transcript = st.text_area(
+            "You can edit the transcript before sending:",
+            value=st.session_state.pending_transcript,
+            height=120,
+        )
+
+        detected_language = (
+            st.session_state.pending_language
         )
 
         detected_name = (
             LANGUAGE_NAMES.get(
-
-                st.session_state.pending_language,
-
-                st.session_state.pending_language
+                detected_language,
+                detected_language
             )
         )
 
         st.info(
-            f"🌍 Detected language: {detected_name}"
-        )
-
-        edited_transcript = st.text_area(
-
-            "This is exactly what Whisper heard. Edit if necessary.",
-
-            value=st.session_state.pending_transcript,
-
-            height=150,
-
-            key="editable_transcript"
+            f"🌍 Response language: {detected_name}"
         )
 
         col1, col2 = st.columns(2)
@@ -1805,86 +2127,117 @@ def main():
         with col1:
 
             if st.button(
-
-                "🗑️ Record Again",
-
+                "🔄 Record Again",
                 use_container_width=True
             ):
 
                 st.session_state.pending_transcript = ""
 
-                st.session_state.pending_language = "en"
-
                 st.session_state.recorder_key += 1
 
                 st.rerun()
 
-
         with col2:
 
             if st.button(
-
-                "✅ Send to AI",
-
+                "🚀 Send to AI",
                 use_container_width=True
             ):
 
-                user_text = (
+                final_text = (
                     edited_transcript.strip()
                 )
 
-                language_code = (
-                    st.session_state.pending_language
-                )
+                if final_text:
 
-                if not user_text:
+                    # =================================================
+                    # RE-DETECT EDITED TEXT
+                    # =================================================
 
-                    st.warning(
-                        "Please enter some text."
+                    edited_language = (
+                        detect_text_language(
+                            final_text
+                        )
                     )
 
-                else:
+                    if edited_language != "en":
+
+                        final_language = (
+                            edited_language
+                        )
+
+                    else:
+
+                        final_language = (
+                            st.session_state.pending_language
+                        )
+
+                    final_language_name = (
+                        LANGUAGE_NAMES.get(
+                            final_language,
+                            final_language
+                        )
+                    )
+
+                    print(
+                        f"Final voice language: "
+                        f"{final_language}"
+                    )
+
+                    print(
+                        f"Final voice language name: "
+                        f"{final_language_name}"
+                    )
 
                     process_user_message(
-
-                        user_text,
-
-                        language_code
+                        user_message=final_text,
+                        language_code=final_language,
                     )
 
                     st.session_state.pending_transcript = ""
 
-                    st.session_state.pending_language = "en"
-
-                    st.session_state.recorder_key += 1
-
                     st.rerun()
 
-
     # ========================================================
-    # NORMAL CHAT
+    # NORMAL CHAT INPUT
     # ========================================================
 
-    st.markdown(
-        "### 💬 Chat"
+    user_text = st.chat_input(
+        "Type your message here..."
     )
 
-    prompt = st.chat_input(
+    if user_text:
 
-        "Message your AI assistant..."
-    )
+        # ====================================================
+        # AUTOMATIC TYPED LANGUAGE DETECTION
+        # ====================================================
 
+        language_code = (
+            detect_text_language(
+                user_text
+            )
+        )
 
-    if prompt:
+        typed_language_name = (
+            LANGUAGE_NAMES.get(
+                language_code,
+                language_code
+            )
+        )
 
-        # For text chat we allow Gemini
-        # to understand the language itself.
+        print(
+            f"Typed language detected: "
+            f"{language_code}"
+        )
+
+        print(
+            f"Typed language name: "
+            f"{typed_language_name}"
+        )
 
         process_user_message(
-
-            prompt,
-
-            "auto"
+            user_message=user_text,
+            language_code=language_code,
         )
 
         st.rerun()

@@ -6,6 +6,7 @@ import tempfile
 import subprocess
 import shutil
 import hashlib
+import json
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, urldefrag
 
@@ -19,6 +20,18 @@ import fitz  # PyMuPDF
 from docx import Document
 import requests
 from bs4 import BeautifulSoup
+
+from database import (
+    create_session as db_create_session,
+    list_sessions as db_list_sessions,
+    get_session as db_get_session,
+    update_session_title as db_update_session_title,
+    save_message as db_save_message,
+    load_messages as db_load_messages,
+    save_source as db_save_source,
+    delete_session as db_delete_session,
+    clear_all_history as db_clear_all_history,
+)
 
 
 # ============================================================
@@ -644,10 +657,54 @@ def detect_roman_language(text):
 # TEXT LANGUAGE
 # ============================================================
 
+def detect_explicit_language_request(text):
+
+    """Detect direct requests such as 'banglay bolo' or 'answer in Hindi'."""
+
+    if not text:
+        return None
+
+    normalized = " ".join(normalize_words(text))
+
+    patterns = {
+        "bn": [
+            r"bangla(?:y|te)?\s+(?:bolo|bolun|dao|den|likho|lekho|answer|reply)",
+            r"banglish\s+(?:e|te)?\s*(?:bolo|answer|reply|dao)",
+            r"bengali\s+(?:te|in)?\s*(?:bolo|answer|reply)",
+            r"বাংলা(?:য়|য়|তে)?",
+        ],
+        "hi": [
+            r"hindi\s+(?:me|mein|mai|in)?\s*(?:bolo|batao|answer|reply|do)",
+            r"hinglish\s+(?:me|mein|e)?\s*(?:bolo|answer|reply)",
+            r"हिंदी\s*(?:में|मे)?",
+        ],
+        "en": [
+            r"(?:answer|reply|respond)\s+in\s+english",
+            r"english\s+(?:e|te|me)?\s*(?:bolo|answer|reply)",
+        ],
+        "ta": [r"tamil\s+(?:la|il|in)?\s*(?:answer|reply|bolo)", r"தமிழில்"],
+        "te": [r"telugu\s+(?:lo|in)?\s*(?:answer|reply|cheppu)", r"తెలుగులో"],
+        "or": [r"odia\s+(?:re|te)?\s*(?:answer|reply|bolo)", r"ଓଡ଼ିଆରେ"],
+        "mr": [r"marathi\s+(?:madhe|in)?\s*(?:answer|reply|sanga)", r"मराठीत"],
+        "gu": [r"gujarati\s+(?:ma|in)?\s*(?:answer|reply)", r"ગુજરાતીમાં"],
+    }
+
+    for language, expressions in patterns.items():
+        for expression in expressions:
+            if re.search(expression, text, flags=re.IGNORECASE):
+                return language
+
+    return None
+
+
 def detect_text_language(text):
 
     if not text or not text.strip():
         return "en"
+
+    explicit_language = detect_explicit_language_request(text)
+    if explicit_language in LANGUAGE_NAMES:
+        return explicit_language
 
     script_language = detect_script_language(text)
 
@@ -5581,6 +5638,10 @@ def text_to_speech(
 
 DEFAULTS = {
 
+    "active_session_id": None,
+
+    "messages_loaded": False,
+
     "messages": [],
 
     "pending_transcript": "",
@@ -5614,6 +5675,36 @@ for key, value in DEFAULTS.items():
     if key not in st.session_state:
 
         st.session_state[key] = value
+
+
+# ============================================================
+# DATABASE SESSION INITIALIZATION
+# ============================================================
+
+def ensure_active_session():
+
+    active_id = st.session_state.get("active_session_id")
+
+    if active_id and db_get_session(active_id):
+        if not st.session_state.get("messages_loaded", False):
+            st.session_state.messages = db_load_messages(active_id)
+            st.session_state.messages_loaded = True
+        return active_id
+
+    sessions = db_list_sessions(limit=1)
+
+    if sessions:
+        active_id = sessions[0]["id"]
+    else:
+        active_id = db_create_session("New Chat")
+
+    st.session_state.active_session_id = active_id
+    st.session_state.messages = db_load_messages(active_id)
+    st.session_state.messages_loaded = True
+    return active_id
+
+
+ensure_active_session()
 
 
 # ============================================================
@@ -5681,16 +5772,15 @@ def clear_source():
 
 def start_new_chat():
 
+    active_id = db_create_session("New Chat")
+
+    st.session_state.active_session_id = active_id
     st.session_state.messages = []
-
+    st.session_state.messages_loaded = True
     st.session_state.pending_transcript = ""
-
     st.session_state.pending_language = "en"
-
     st.session_state.recorder_key += 1
-
     st.session_state.voice_ready = False
-
     clear_source()
 
 
@@ -5825,6 +5915,22 @@ def process_user_message(
         language_code,
     })
 
+    # Persist the user message immediately.
+    session_id = ensure_active_session()
+    db_save_message(
+        session_id,
+        "user",
+        user_message,
+        language_code,
+    )
+
+    current_session = db_get_session(session_id)
+    if current_session and current_session.get("title") == "New Chat":
+        db_update_session_title(
+            session_id,
+            user_message[:80].strip() or "New Chat"
+        )
+
     try:
 
         with st.spinner(
@@ -5908,6 +6014,15 @@ def process_user_message(
 
     st.session_state.messages.append(
         assistant_message
+    )
+
+    # Persist answer + exact source visuals in SQL.
+    db_save_message(
+        session_id,
+        "assistant",
+        response,
+        language_code,
+        relevant_media,
     )
 
     # --------------------------------------------------------
@@ -6089,139 +6204,100 @@ def render_messages():
 
 def render_sidebar():
 
+    ensure_active_session()
+
     with st.sidebar:
 
-        st.title(
-            "🎙️ AI Voice Assistant"
-        )
+        st.title("🎙️ AI Voice Assistant")
 
         st.caption(
-            "Multilingual AI assistant with "
-            "document, video and website understanding."
+            "Multilingual AI assistant with document, video, "
+            "website understanding and SQL chat history."
         )
 
         st.divider()
 
-        if st.button(
-            "🆕 New Chat",
-            use_container_width=True
-        ):
-
+        if st.button("🆕 New Chat", use_container_width=True):
             start_new_chat()
-
-            st.rerun()
-
-        if st.button(
-            "🗑️ Clear Uploaded Source",
-            use_container_width=True
-        ):
-
-            clear_source()
-
             st.rerun()
 
         st.divider()
+        st.subheader("📚 Chat History")
 
-        st.subheader(
-            "📚 Current Source"
-        )
+        sessions = db_list_sessions(limit=50)
 
-        source = (
-            st.session_state.source_data
-        )
-
-        if source:
-
-            source_type = source.get(
-                "source_type",
-                "unknown"
-            )
-
-            filename = source.get(
-                "filename",
-                ""
-            )
-
-            if source_type == "website":
-
-                st.success(
-                    "🌐 Website analyzed"
-                )
-
-                st.caption(
-                    filename
-                )
-
-            else:
-
-                st.success(
-                    f"📎 {source_type.upper()}"
-                )
-
-                st.caption(
-                    filename
-                )
-
+        if not sessions:
+            st.caption("No saved chats yet.")
         else:
+            for item in sessions:
+                session_id = item["id"]
+                title = item.get("title") or "New Chat"
+                label = title[:42] + ("…" if len(title) > 42 else "")
 
-            st.caption(
-                "No source uploaded."
-            )
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    if st.button(
+                        ("🟢 " if session_id == st.session_state.active_session_id else "💬 ") + label,
+                        key=f"open_chat_{session_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.active_session_id = session_id
+                        st.session_state.messages = db_load_messages(session_id)
+                        st.session_state.messages_loaded = True
+                        clear_source()
+                        st.rerun()
+                with c2:
+                    if st.button("🗑️", key=f"delete_chat_{session_id}"):
+                        db_delete_session(session_id)
+                        if session_id == st.session_state.active_session_id:
+                            remaining = db_list_sessions(limit=1)
+                            if remaining:
+                                st.session_state.active_session_id = remaining[0]["id"]
+                                st.session_state.messages = db_load_messages(remaining[0]["id"])
+                            else:
+                                new_id = db_create_session("New Chat")
+                                st.session_state.active_session_id = new_id
+                                st.session_state.messages = []
+                            st.session_state.messages_loaded = True
+                        st.rerun()
 
         st.divider()
 
-        st.subheader(
-            "🌍 Supported Languages"
-        )
-
-        st.write(
-            ", ".join(
-                LANGUAGE_NAMES.values()
-            )
-        )
-
-        st.divider()
-
-        st.subheader(
-            "⚙️ System Status"
-        )
-
-        st.write(
-            "Whisper:",
-            "✅"
-            if WHISPER_MODEL_NAME
-            else "❌"
-        )
-
-        st.write(
-            "Gemini:",
-            "✅"
-            if GEMINI_API_KEY
-            else "❌"
-        )
-
-        st.write(
-            "Playwright:",
-            "✅"
-            if PLAYWRIGHT_AVAILABLE
-            else "❌"
-        )
-
-        st.write(
-            "FFmpeg:",
-            "✅"
-            if check_ffmpeg()
-            else "❌"
-        )
-
-        if st.button(
-            "🧹 Clear Chat History",
-            use_container_width=True
-        ):
-
+        if st.button("🧹 Delete All Chat History", use_container_width=True):
+            db_clear_all_history()
+            new_id = db_create_session("New Chat")
+            st.session_state.active_session_id = new_id
             st.session_state.messages = []
-
+            st.session_state.messages_loaded = True
             st.rerun()
+
+        if st.button("🗑️ Clear Uploaded Source", use_container_width=True):
+            clear_source()
+            st.rerun()
+
+        st.divider()
+        st.subheader("📌 Current Source")
+
+        source = st.session_state.source_data
+        if source:
+            source_type = source.get("source_type", "unknown")
+            filename = source.get("filename", "")
+            st.success(f"📎 {source_type.upper()}")
+            st.caption(filename)
+        else:
+            st.caption("No source uploaded.")
+
+        st.divider()
+        st.subheader("🌍 Supported Languages")
+        st.write(", ".join(LANGUAGE_NAMES.values()))
+
+        st.divider()
+        st.subheader("⚙️ System Status")
+        st.write("Whisper:", "✅" if WHISPER_MODEL_NAME else "❌")
+        st.write("Gemini:", "✅" if GEMINI_API_KEY else "❌")
+        st.write("Playwright:", "✅" if PLAYWRIGHT_AVAILABLE else "❌")
+        st.write("FFmpeg:", "✅" if check_ffmpeg() else "❌")
+        st.write("SQL Database:", "✅")
 
 
 # ============================================================
@@ -6398,6 +6474,11 @@ def main():
                         st.session_state[
                             "source_filename"
                         ] = website_url
+
+                        db_save_source(
+                            ensure_active_session(),
+                            st.session_state["source_data"]
+                        )
 
                         st.session_state[
                             "website_authenticated"
@@ -6584,6 +6665,11 @@ def main():
                             st.session_state[
                                 "source_filename"
                             ] = original_url
+
+                            db_save_source(
+                                ensure_active_session(),
+                                st.session_state["source_data"]
+                            )
 
                             st.session_state[
                                 "website_authenticated"
@@ -6796,6 +6882,11 @@ def main():
                 st.session_state[
                     "source_filename"
                 ] = uploaded_file.name
+
+                db_save_source(
+                    ensure_active_session(),
+                    processed
+                )
 
                 st.success(
 

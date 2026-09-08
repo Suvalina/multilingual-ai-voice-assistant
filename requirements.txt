@@ -1,12 +1,13 @@
 streamlit==1.62.0
-google-genai
 faster-whisper
 python-dotenv
-pypdf
+edge-tts
+google-genai
+PyMuPDF
 python-docx
 python-pptx
-edge-tts
-PyMuPDF
 requests
 beautifulsoup4
 playwright
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0

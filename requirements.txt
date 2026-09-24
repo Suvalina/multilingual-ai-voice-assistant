@@ -4,6 +4,7 @@ python-dotenv
 edge-tts
 google-genai
 PyMuPDF
+pypdf
 python-docx
 python-pptx
 requests

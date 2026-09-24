@@ -4,9 +4,9 @@ import time
 import uuid
 import tempfile
 import subprocess
+import sys
 import shutil
 import hashlib
-import json
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, urldefrag
 
@@ -16,22 +16,23 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-import fitz  # PyMuPDF
+from pypdf import PdfReader
 from docx import Document
+
+# SQL persistence
+from database import (
+    create_session,
+    load_messages,
+    save_message,
+    save_source,
+    clear_session_messages,
+    touch_session,
+    list_sessions,
+)
+
+import pymupdf  # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
-
-from database import (
-    create_session as db_create_session,
-    list_sessions as db_list_sessions,
-    get_session as db_get_session,
-    update_session_title as db_update_session_title,
-    save_message as db_save_message,
-    load_messages as db_load_messages,
-    save_source as db_save_source,
-    delete_session as db_delete_session,
-    clear_all_history as db_clear_all_history,
-)
 
 
 # ============================================================
@@ -44,14 +45,48 @@ try:
     PLAYWRIGHT_AVAILABLE = True
 
 except Exception:
+
     PLAYWRIGHT_AVAILABLE = False
 
 
 # ============================================================
 # ENVIRONMENT
+# SERVER-SAFE / UTF-8 SAFE
 # ============================================================
 
-load_dotenv()
+def load_environment_safely():
+    """
+    Load .env without depending on the Windows server's default
+    cp1252/charmap encoding.
+
+    Primary: UTF-8
+    Fallback: Latin-1 for legacy Windows-encoded .env files.
+    """
+    try:
+        load_dotenv(encoding="utf-8", override=False)
+        return
+    except UnicodeDecodeError:
+        pass
+
+    try:
+        load_dotenv(encoding="latin-1", override=False)
+        return
+    except Exception as error:
+        raise RuntimeError(
+            "Unable to read the .env file. Please save .env as UTF-8 and try again."
+        ) from error
+
+
+load_environment_safely()
+
+# Prefer UTF-8 for Python standard text streams when supported.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
@@ -65,16 +100,15 @@ WHISPER_MODEL_NAME = os.getenv(
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash-lite"
+    "gemini-3.5-flash"
 ).strip()
 
-FALLBACK_MODELS = [
-    "gemini-2.5-flash"
-]
+if not GEMINI_MODEL:
+    GEMINI_MODEL = "gemini-3.5-flash"
 
-MAX_WEBSITE_PAGES = 50
-WEBSITE_TIMEOUT = 30000
-MAX_SOURCE_TEXT = 50000
+FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+]
 
 
 # ============================================================
@@ -102,13 +136,17 @@ if not GEMINI_API_KEY:
     st.stop()
 
 
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
 client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
 
 # ============================================================
-# LANGUAGE NAMES
+# LANGUAGES
 # ============================================================
 
 LANGUAGE_NAMES = {
@@ -133,25 +171,31 @@ LANGUAGE_NAMES = {
     "es": "Spanish",
     "it": "Italian",
     "pt": "Portuguese",
+
     "ja": "Japanese",
     "ko": "Korean",
     "zh": "Chinese",
+
     "ru": "Russian",
     "ar": "Arabic",
     "tr": "Turkish",
+
     "id": "Indonesian",
     "vi": "Vietnamese",
     "th": "Thai",
+
     "pl": "Polish",
     "nl": "Dutch",
     "sv": "Swedish",
     "da": "Danish",
     "fi": "Finnish",
+
     "uk": "Ukrainian",
     "cs": "Czech",
     "ro": "Romanian",
     "el": "Greek",
     "he": "Hebrew",
+
     "hu": "Hungarian",
     "no": "Norwegian",
     "sk": "Slovak",
@@ -159,6 +203,7 @@ LANGUAGE_NAMES = {
     "hr": "Croatian",
     "sr": "Serbian",
     "sl": "Slovenian",
+
     "sw": "Swahili",
     "af": "Afrikaans",
 }
@@ -171,6 +216,7 @@ LANGUAGE_NAMES = {
 TTS_VOICES = {
 
     "en": "en-US-AriaNeural",
+
     "hi": "hi-IN-SwaraNeural",
     "bn": "bn-IN-TanishaaNeural",
     "or": "or-IN-SubhasiniNeural",
@@ -178,37 +224,43 @@ TTS_VOICES = {
     "te": "te-IN-ShrutiNeural",
     "ne": "ne-NP-HemkalaNeural",
     "gu": "gu-IN-DhwaniNeural",
-    "as": "en-IN-NeerjaNeural",
+    "as": "as-IN-PriyomNeural",
     "mr": "mr-IN-AarohiNeural",
     "kn": "kn-IN-SapnaNeural",
     "ml": "ml-IN-SobhanaNeural",
     "pa": "pa-IN-OjasNeural",
-    "ur": "ur-PK-UzmaNeural",
+    "ur": "ur-PK-AsadNeural",
 
     "fr": "fr-FR-DeniseNeural",
     "de": "de-DE-KatjaNeural",
     "es": "es-ES-ElviraNeural",
     "it": "it-IT-ElsaNeural",
     "pt": "pt-BR-FranciscaNeural",
+
     "ja": "ja-JP-NanamiNeural",
     "ko": "ko-KR-SunHiNeural",
     "zh": "zh-CN-XiaoxiaoNeural",
+
     "ru": "ru-RU-SvetlanaNeural",
     "ar": "ar-SA-ZariyahNeural",
     "tr": "tr-TR-EmelNeural",
+
     "id": "id-ID-GadisNeural",
     "vi": "vi-VN-HoaiMyNeural",
     "th": "th-TH-PremwadeeNeural",
+
     "pl": "pl-PL-ZofiaNeural",
     "nl": "nl-NL-ColetteNeural",
     "sv": "sv-SE-SofieNeural",
     "da": "da-DK-ChristelNeural",
     "fi": "fi-FI-NooraNeural",
+
     "uk": "uk-UA-PolinaNeural",
     "cs": "cs-CZ-VlastaNeural",
     "ro": "ro-RO-AlinaNeural",
     "el": "el-GR-AthinaNeural",
     "he": "he-IL-HilaNeural",
+
     "hu": "hu-HU-NoemiNeural",
     "no": "nb-NO-IselinNeural",
     "sk": "sk-SK-ViktoriaNeural",
@@ -216,200 +268,307 @@ TTS_VOICES = {
     "hr": "hr-HR-GabrijelaNeural",
     "sr": "sr-RS-SophieNeural",
     "sl": "sl-SI-PetraNeural",
+
     "sw": "sw-KE-ZuriNeural",
     "af": "af-ZA-AdriNeural",
 }
 
 
 # ============================================================
-# ROMAN LANGUAGE WORDS
+# ROMANIZED BENGALI
 # ============================================================
 
 ROMAN_BENGALI = {
+
     "ami", "amar", "amake", "amra", "amader",
-    "tumi", "tomar", "tomake", "tomra",
+    "tumi", "tomar", "tomake", "tomra", "tomader",
     "apni", "apnar", "apnake",
-    "ki", "kothay", "kothai", "kivabe", "kirokom",
-    "keno", "kokhon", "ke", "kar",
-    "ache", "achi", "acho", "achen",
+
+    "se", "she", "tar", "take",
+
+    "ki", "ke", "kake", "kemon", "kamon",
+    "keno", "kothay", "kotha", "kokhon",
+    "kivabe", "kirokom",
+
+    "achi", "achhi", "acho", "achho", "ache", "achen",
+    "chilam", "chhilam", "chilo", "chhilo",
+
+    "korchi", "korchhi", "korcho", "korchho",
+    "korchen", "korbo", "korbe", "koro",
+    "korben", "kore",
+
+    "jacchi", "jachhi", "jacchhi", "jachcho",
+    "jaccho", "jabo", "jabe",
+
+    "gechi", "gechhi", "geche",
+
+    "asche", "aschhe", "aschhi", "aschi",
+    "ashchi", "ashche",
+
+    "khacchi", "khachhi", "khaccho",
+    "khachcho", "khabo", "kheye",
+
+    "bhalo", "valo", "valobasha", "bhalobasha",
+    "kharap", "sundor", "onek", "khub", "ektu",
+    "sob", "shob", "kichu", "kono",
+
+    "ekhane", "okhane", "sekhane", "sekhaney",
+
+    "aj", "aaj", "kal", "ekhon",
+
+    "naam", "nam",
+
     "hobe", "hoy", "hoye", "hoyeche",
-    "kor", "koro", "korbo", "korchi", "korte",
-    "jabo", "jabe", "jacchi", "gechi",
-    "bolo", "bolun", "bolbe", "bollen",
-    "dao", "den", "dewa",
-    "bhalo", "valo", "khub",
-    "ekhane", "okhane", "sekhane",
-    "aj", "kal", "ekhon", "pore",
-    "jani", "janina", "bujhi", "bujhina",
-    "chai", "chaiye", "dorkar", "proyojon",
-    "amar", "tomar",
-    "dhonnobad", "please",
-    "porashona", "project", "office",
-    "kotha", "karon", "jonno",
-    "theke", "sathe", "ache",
-    "hoyechhe", "hochhe",
-    "dekh", "dekhao", "dekhi",
-    "likho", "lekho", "likhe",
-    "shob", "sob", "kichu",
-    "onek", "kom", "beshi",
-    "age", "por",
-    "matha", "bari", "kaj",
-    "somossa", "solution",
-    "bujhiye", "bojhao", "samjhao",
+
+    "dorkar", "proyojon",
+
+    "chai", "chao", "chaichi",
+
+    "dao", "den", "de",
+
+    "dekh", "dekho",
+
+    "bolo", "bol", "bolchi", "bolcho",
+
+    "jante", "jani", "janina",
+
+    "parbo", "pari", "parena",
+
+    "na", "nei", "noy",
+
+    "hya", "ha", "haan",
+
+    "dhonnobad",
+
+    "bari", "ghor", "bondhu",
+    "ma", "baba", "dada", "didi",
+    "bhai", "bon",
+
+    "porashona", "porchi", "porte",
+
+    "kaj", "chakri", "project", "office",
 }
 
+
+# ============================================================
+# ROMANIZED HINDI
+# ============================================================
 
 ROMAN_HINDI = {
-    "main", "mein", "mera", "meri", "mere",
-    "mujhe", "mujhko", "hum", "hamara",
-    "aap", "aapka", "aapki", "aapko",
+
+    "main", "mera", "meri", "mujhe",
+    "hum", "hamara", "hamari",
+
+    "aap", "aapka", "aapki",
     "tum", "tumhara", "tumhe",
-    "kya", "kaise", "kyu", "kyon",
-    "kahan", "kab", "kaun",
-    "hai", "hain", "hoon", "ho",
+
+    "kya", "kaise", "kaisa", "kyun",
+    "kyon", "kahan", "kab", "kaun",
+
+    "hai", "hain", "hoon",
+
     "tha", "thi", "the",
-    "hoga", "hogi", "hon",
-    "kar", "karo", "karna", "karta",
-    "karti", "karte", "karunga",
-    "ja", "jana", "jaunga", "jaungi",
+
+    "kar", "karo", "karna",
+    "karunga", "karenge",
+
+    "ja", "jana", "jaunga", "jaoge", "jao",
+
+    "aa", "aana", "aunga",
+
     "acha", "accha", "achha",
-    "bahut", "nahi", "nahin",
-    "chahiye", "zarurat", "pata",
-    "samajh", "samjhao", "batao",
-    "bolo", "dekho", "dikhao",
-    "abhi", "aaj", "kal",
-    "phir", "liye", "se",
-    "mera", "tera",
+
+    "bahut", "thoda", "sab", "kuch",
+
+    "ghar", "dost",
+
+    "chahiye",
+
+    "nahi", "nahin",
+
+    "dhanyavad", "shukriya",
 }
 
+
+# ============================================================
+# OTHER LATIN LANGUAGE WORDS
+# ============================================================
 
 ROMAN_LANGUAGE_WORDS = {
 
     "fr": {
-        "bonjour", "merci", "avec", "pour",
-        "comment", "pourquoi", "quoi", "vous",
-        "je", "suis", "dans", "une", "des",
+        "bonjour", "salut", "merci", "comment",
+        "vous", "êtes", "suis", "avec", "pour",
+        "dans", "une", "des", "les", "est",
+        "oui", "non", "je", "tu", "il", "elle",
+        "nous", "mon", "ma", "mes", "très"
     },
 
     "de": {
-        "hallo", "danke", "bitte", "ich",
-        "mein", "meine", "wie", "warum",
-        "was", "ist", "sind", "nicht",
+        "hallo", "danke", "bitte", "wie", "geht",
+        "dir", "ihnen", "ich", "du", "er", "sie",
+        "wir", "mein", "meine", "nicht", "ja",
+        "nein", "und", "ist", "das", "die", "der",
+        "mit", "für", "von", "auf", "sehr"
     },
 
     "es": {
-        "hola", "gracias", "como", "cómo",
-        "porque", "por", "para", "que",
-        "quiero", "necesito", "donde",
+        "hola", "gracias", "como", "cómo", "estas",
+        "estás", "usted", "tú", "yo", "nosotros",
+        "ellos", "ella", "que", "qué", "para",
+        "por", "con", "una", "uno", "los", "las",
+        "del", "es", "muy", "bien", "sí", "si", "no"
     },
 
     "it": {
-        "ciao", "grazie", "come", "perche",
-        "perché", "cosa", "voglio", "sono",
-        "dove", "non",
+        "ciao", "grazie", "come", "stai", "sta",
+        "sono", "sei", "io", "tu", "lui", "lei",
+        "noi", "che", "chi", "cosa", "per",
+        "con", "una", "uno", "gli", "le",
+        "non", "si", "sì", "bene", "molto"
     },
 
     "pt": {
-        "olá", "ola", "obrigado", "obrigada",
-        "como", "porque", "quero", "preciso",
-        "onde", "você", "voce",
+        "olá", "ola", "obrigado", "obrigada", "como",
+        "está", "voce", "você", "eu", "tu",
+        "ele", "ela", "nos", "nós", "que",
+        "para", "por", "com", "uma", "um",
+        "não", "sim", "bem", "muito"
     },
 
     "tr": {
-        "merhaba", "tesekkur", "teşekkür",
-        "nasıl", "nasil", "neden", "ne",
-        "ben", "sen", "istiyorum",
+        "merhaba", "selam", "teşekkür", "tesekkur",
+        "nasılsın", "nasilsin", "nasıl", "nasil",
+        "ben", "sen", "siz", "biz", "bu",
+        "ne", "neden", "nerede", "evet", "hayır",
+        "hayir", "değil", "degil", "çok", "cok"
     },
 
     "id": {
-        "halo", "terima", "kasih", "bagaimana",
-        "mengapa", "apa", "saya", "anda",
-        "ingin", "butuh",
+        "halo", "hai", "terima", "kasih", "bagaimana",
+        "kamu", "anda", "saya", "aku", "dia",
+        "kami", "kita", "apa", "kenapa", "dimana",
+        "di", "yang", "dan", "untuk", "dengan",
+        "tidak", "iya", "ya", "baik", "sangat"
     },
 
     "vi": {
-        "xin", "chào", "cam", "ơn", "cảm",
-        "như", "thế", "nào", "tôi", "bạn",
-        "muốn", "cần",
+        "xin", "chào", "chao", "cảm", "cam",
+        "ơn", "on", "không", "khong", "bạn",
+        "ban", "tôi", "toi", "mình", "minh",
+        "là", "la", "gì", "gi", "nào", "nao",
+        "ở", "o", "đâu", "dau", "vâng", "vang"
     },
 
     "nl": {
-        "hallo", "dank", "dankje", "hoe",
-        "waarom", "wat", "ik", "jij",
-        "niet", "wil",
+        "hallo", "hoi", "bedankt", "dank", "hoe",
+        "gaat", "het", "met", "jou", "u",
+        "ik", "jij", "je", "hij", "zij",
+        "wij", "wat", "waar", "waarom", "niet",
+        "ja", "nee", "goed", "voor", "van"
     },
 
     "sv": {
-        "hej", "tack", "hur", "varför",
-        "vad", "jag", "du", "inte",
+        "hej", "tack", "hur", "mår", "mar",
+        "du", "jag", "han", "hon", "vi",
+        "vad", "var", "varför", "varfor",
+        "inte", "ja", "nej", "bra", "och",
+        "det", "är", "ar"
     },
 
     "da": {
-        "hej", "tak", "hvordan", "hvorfor",
-        "hvad", "jeg", "du", "ikke",
+        "hej", "tak", "hvordan", "har", "du",
+        "det", "jeg", "han", "hun", "vi",
+        "hvad", "hvor", "hvorfor", "ikke",
+        "ja", "nej", "godt", "og", "er"
     },
 
     "fi": {
-        "hei", "kiitos", "miten", "miksi",
-        "mitä", "minä", "sinä", "en",
+        "hei", "kiitos", "mitä", "mita", "kuuluu",
+        "sinä", "sina", "minä", "mina", "hän",
+        "han", "me", "te", "miksi", "missä",
+        "missa", "ei", "kyllä", "kylla", "hyvä",
+        "hyva"
     },
 
     "pl": {
-        "czesc", "cześć", "dziekuje",
-        "dziękuję", "jak", "dlaczego",
-        "co", "jest", "nie", "chce",
+        "cześć", "czesc", "dzień", "dzien", "dobry",
+        "dziękuję", "dziekuje", "jak", "się", "sie",
+        "masz", "mam", "jest", "nie", "tak",
+        "co", "gdzie", "dlaczego", "ja", "ty",
+        "my", "wy", "oni"
     },
 
     "ro": {
-        "salut", "multumesc", "mulțumesc",
-        "cum", "de", "ce", "ce", "vreau",
-        "sunt", "nu",
+        "salut", "bună", "buna", "mulțumesc",
+        "multumesc", "cum", "ești", "esti",
+        "sunt", "eu", "tu", "el", "ea",
+        "noi", "ce", "unde", "de", "nu",
+        "da", "bine", "foarte", "pentru", "cu"
     },
 
     "hu": {
-        "szia", "köszönöm", "koszonom",
-        "hogyan", "miért", "miert",
-        "mit", "én", "en", "nem",
+        "szia", "köszönöm", "koszonom", "hogy",
+        "vagy", "én", "en", "te", "ő", "o",
+        "mi", "ti", "ők", "ok", "nem", "igen",
+        "miért", "miert", "hol", "jó", "jo"
     },
 
     "cs": {
-        "ahoj", "děkuji", "dekuji",
-        "jak", "proč", "proc", "co",
-        "jsem", "není", "neni",
+        "ahoj", "děkuji", "dekuji", "jak", "se",
+        "máš", "mas", "mám", "mam", "jsem",
+        "jsi", "on", "ona", "my", "co",
+        "kde", "proč", "proc", "ano", "ne",
+        "dobře", "dobre"
     },
 
     "sk": {
-        "ahoj", "ďakujem", "dakujem",
-        "ako", "prečo", "preco",
-        "čo", "co", "som", "nie",
+        "ahoj", "ďakujem", "dakujem", "ako",
+        "sa", "máš", "mas", "som", "si",
+        "on", "ona", "my", "čo", "co",
+        "kde", "prečo", "preco", "áno", "ano",
+        "nie", "dobre"
     },
 
     "sl": {
-        "zdravo", "hvala", "kako",
-        "zakaj", "kaj", "jaz", "ti",
-        "ni",
+        "zdravo", "hvala", "kako", "si", "kaj",
+        "jaz", "ti", "on", "ona", "mi",
+        "kje", "zakaj", "ne", "da", "dobro"
     },
 
     "hr": {
-        "bok", "hvala", "kako", "zašto",
-        "zasto", "što", "sto", "ja", "ti",
-        "nije",
+        "bok", "zdravo", "hvala", "kako", "si",
+        "ja", "ti", "on", "ona", "mi",
+        "što", "sto", "gdje", "zasto", "zašto",
+        "da", "ne", "dobro"
     },
 
     "sr": {
-        "zdravo", "hvala", "kako", "zašto",
-        "zasto", "šta", "sta", "ja", "ti",
-        "nije",
+        "zdravo", "ćao", "cao", "hvala", "kako",
+        "si", "ja", "ti", "on", "ona", "mi",
+        "šta", "sta", "gde", "zasto", "zašto",
+        "da", "ne", "dobro"
     },
 
     "sw": {
-        "habari", "asante", "vipi", "nini",
-        "kwa", "mimi", "wewe", "sawa",
+        "habari", "asante", "tafadhali", "jina",
+        "langu", "wewe", "mimi", "yeye", "sisi",
+        "nini", "wapi", "kwa", "na", "ni",
+        "hapana", "ndiyo", "nzuri", "sana"
     },
 
     "af": {
-        "hallo", "dankie", "hoe", "hoekom",
-        "wat", "ek", "jy", "nie",
+        "hallo", "dankie", "hoe", "gaan", "dit",
+        "met", "jou", "ek", "jy", "hy",
+        "sy", "ons", "wat", "waar", "hoekom",
+        "nie", "ja", "nee", "goed", "baie"
+    },
+
+    "no": {
+        "hei", "hallo", "takk", "hvordan", "har",
+        "du", "jeg", "han", "hun", "vi",
+        "hva", "hvor", "hvorfor", "ikke",
+        "ja", "nei", "bra", "og", "er"
     },
 }
 
@@ -425,48 +584,91 @@ def detect_script_language(text):
 
     counts = {}
 
-    ranges = {
+    for ch in text:
 
-        "bn": (0x0980, 0x09FF),
-        "hi": (0x0900, 0x097F),
-        "pa": (0x0A00, 0x0A7F),
-        "gu": (0x0A80, 0x0AFF),
-        "or": (0x0B00, 0x0B7F),
-        "ta": (0x0B80, 0x0BFF),
-        "te": (0x0C00, 0x0C7F),
-        "kn": (0x0C80, 0x0CFF),
-        "ml": (0x0D00, 0x0D7F),
-        "th": (0x0E00, 0x0E7F),
-        "he": (0x0590, 0x05FF),
-        "ar": (0x0600, 0x06FF),
-        "ja": (0x3040, 0x30FF),
-        "ko": (0xAC00, 0xD7AF),
-        "zh": (0x4E00, 0x9FFF),
-        "ru": (0x0400, 0x04FF),
-        "el": (0x0370, 0x03FF),
-    }
+        if not ch.isalpha():
+            continue
 
-    for char in text:
+        code = ord(ch)
+        language = None
 
-        code = ord(char)
+        if 0x0980 <= code <= 0x09FF:
+            language = "bn"
 
-        for lang, (start, end) in ranges.items():
+        elif 0x0900 <= code <= 0x097F:
+            language = "hi"
 
-            if start <= code <= end:
+        elif 0x0A00 <= code <= 0x0A7F:
+            language = "pa"
 
-                counts[lang] = counts.get(lang, 0) + 1
-                break
+        elif 0x0A80 <= code <= 0x0AFF:
+            language = "gu"
+
+        elif 0x0B00 <= code <= 0x0B7F:
+            language = "or"
+
+        elif 0x0B80 <= code <= 0x0BFF:
+            language = "ta"
+
+        elif 0x0C00 <= code <= 0x0C7F:
+            language = "te"
+
+        elif 0x0C80 <= code <= 0x0CFF:
+            language = "kn"
+
+        elif 0x0D00 <= code <= 0x0D7F:
+            language = "ml"
+
+        elif 0x0E00 <= code <= 0x0E7F:
+            language = "th"
+
+        elif 0x0590 <= code <= 0x05FF:
+            language = "he"
+
+        elif (
+            0x0600 <= code <= 0x06FF
+            or 0x0750 <= code <= 0x077F
+            or 0x08A0 <= code <= 0x08FF
+            or 0xFB50 <= code <= 0xFDFF
+            or 0xFE70 <= code <= 0xFEFF
+        ):
+            language = "ar"
+
+        elif (
+            0x3040 <= code <= 0x309F
+            or 0x30A0 <= code <= 0x30FF
+            or 0x31F0 <= code <= 0x31FF
+        ):
+            language = "ja"
+
+        elif 0xAC00 <= code <= 0xD7AF:
+            language = "ko"
+
+        elif 0x4E00 <= code <= 0x9FFF:
+            language = "zh"
+
+        elif 0x0400 <= code <= 0x04FF:
+            language = "ru"
+
+        elif 0x0370 <= code <= 0x03FF:
+            language = "el"
+
+        if language:
+
+            counts[language] = (
+                counts.get(language, 0) + 1
+            )
 
     if not counts:
         return None
 
-    language, count = max(
-        counts.items(),
-        key=lambda x: x[1]
+    strongest = max(
+        counts,
+        key=counts.get
     )
 
-    if count >= 2:
-        return language
+    if counts[strongest] >= 2:
+        return strongest
 
     return None
 
@@ -477,30 +679,33 @@ def detect_script_language(text):
 
 def contains_urdu_specific_characters(text):
 
+    urdu_specific = set(
+        "ٹڈڑںھہےےژچگپ"
+    )
+
     return any(
-        char in set("ٹڈڑںھہےےژچگپ")
-        for char in text
+        ch in urdu_specific
+        for ch in text
     )
 
 
 # ============================================================
-# WORD NORMALIZATION
+# NORMALIZE
 # ============================================================
 
 def normalize_words(text):
 
-    if not text:
-        return []
+    text = str(text).lower().strip()
 
-    text = text.lower().strip()
+    replacements = {
+        "’": "'",
+        "‘": "'",
+        "“": '"',
+        "”": '"',
+    }
 
-    text = (
-        text
-        .replace("’", "'")
-        .replace("‘", "'")
-        .replace("“", '"')
-        .replace("”", '"')
-    )
+    for old, new in replacements.items():
+        text = text.replace(old, new)
 
     return re.findall(
         r"[^\W_]+",
@@ -515,268 +720,322 @@ def normalize_words(text):
 
 def detect_roman_language(text):
 
-    words = set(
-        normalize_words(text)
-    )
+    if not text:
+        return "en"
+
+    words = normalize_words(text)
 
     if not words:
         return "en"
 
-    # --------------------------------------------------------
-    # Bengali
-    # --------------------------------------------------------
+    word_set = set(words)
+
+    normalized = " ".join(words)
+
+    bengali_phrases = [
+
+        "tumi kemon acho",
+        "tumi kamon acho",
+        "tumi kemon achho",
+        "tumi kamon achho",
+
+        "ami bhalo achi",
+        "ami valo achi",
+        "ami bhalo achhi",
+        "ami valo achhi",
+
+        "tumi ki korcho",
+        "tumi ki korchho",
+        "tumi ki korbe",
+
+        "kothay jabe",
+        "kivabe korbo",
+
+        "amar naam",
+        "amar nam",
+
+        "ami jani na",
+
+        "tumi ki",
+        "amar ki",
+        "eta ki",
+        "ota ki",
+
+        "ki korcho",
+        "ki korchho",
+
+        "kemon acho",
+        "kamon acho",
+    ]
+
+    for phrase in bengali_phrases:
+
+        if phrase in normalized:
+            return "bn"
 
     bn_score = len(
-        words.intersection(
+        word_set.intersection(
             ROMAN_BENGALI
         )
     )
 
-    # --------------------------------------------------------
-    # Hindi
-    # --------------------------------------------------------
+    strong_bn = {
+
+        "ami", "amar", "amake",
+        "tumi", "tomar", "tomake",
+        "apni", "apnar",
+
+        "kemon", "kamon",
+        "kothay", "kivabe",
+
+        "achi", "achhi",
+        "acho", "achho",
+
+        "korchi", "korchhi",
+        "korcho", "korchho",
+
+        "korbo", "korbe",
+
+        "jacchi", "jachhi",
+        "jabo", "jabe",
+
+        "bhalo", "valo",
+
+        "ekhane", "okhane",
+
+        "bolchi", "bolcho",
+
+        "jani", "janina",
+
+        "dhonnobad",
+    }
+
+    strong_bn_score = len(
+        word_set.intersection(
+            strong_bn
+        )
+    )
+
+    if strong_bn_score >= 1:
+        return "bn"
+
+    hindi_phrases = [
+
+        "main theek hoon",
+        "main thik hoon",
+
+        "aap kaise hain",
+        "tum kaise ho",
+
+        "tum kya kar rahe ho",
+
+        "mujhe nahi pata",
+        "mujhe kya karna hai",
+
+        "kahan ja rahe ho",
+
+        "kaise ho",
+    ]
+
+    for phrase in hindi_phrases:
+
+        if phrase in normalized:
+            return "hi"
 
     hi_score = len(
-        words.intersection(
+        word_set.intersection(
             ROMAN_HINDI
         )
     )
 
-    # Strong Bengali phrases
-    bn_phrases = [
-        "ami chai",
-        "amar jonno",
-        "amake bolo",
-        "kivabe korbo",
-        "ki korbo",
-        "ki kore",
-        "bujhiye dao",
-        "bujhiye bolo",
-        "ekhane bolo",
-        "amar project",
-        "office e",
-        "kothay change",
-        "step by step bolo",
-    ]
+    strong_hi = {
 
-    # Strong Hindi phrases
-    hi_phrases = [
-        "mujhe batao",
-        "mujhe samjhao",
-        "kaise karu",
-        "kya karu",
-        "mere liye",
-        "mujhe chahiye",
-        "step by step batao",
-        "kahan change",
-    ]
+        "main", "mera", "meri", "mujhe",
 
-    normalized = " ".join(
-        normalize_words(text)
+        "hum", "hamara", "hamari",
+
+        "aap", "aapka", "aapki",
+
+        "tum", "tumhara", "tumhe",
+
+        "kya", "kaise", "kaisa",
+
+        "kyun", "kyon", "kahan",
+
+        "hai", "hain", "hoon",
+
+        "acha", "accha", "achha",
+
+        "bahut", "nahi", "nahin",
+
+        "chahiye",
+
+        "dhanyavad", "shukriya",
+    }
+
+    strong_hi_score = len(
+        word_set.intersection(
+            strong_hi
+        )
     )
 
-    for phrase in bn_phrases:
-
-        if phrase in normalized:
-            bn_score += 5
-
-    for phrase in hi_phrases:
-
-        if phrase in normalized:
-            hi_score += 5
-
-    # Bengali wins ties
-    if bn_score >= 2 and bn_score >= hi_score:
-        return "bn"
-
-    if hi_score >= 2:
+    if (
+        strong_hi_score >= 2
+        and strong_hi_score >= bn_score
+    ):
         return "hi"
-
-    # --------------------------------------------------------
-    # Other Roman languages
-    # --------------------------------------------------------
 
     scores = {}
 
-    for language, vocabulary in ROMAN_LANGUAGE_WORDS.items():
+    for language_code, vocabulary in (
+        ROMAN_LANGUAGE_WORDS.items()
+    ):
 
         score = len(
-            words.intersection(
+            word_set.intersection(
                 vocabulary
             )
         )
 
         if score:
-            scores[language] = score
+            scores[language_code] = score
 
     distinctive = {
 
         "bonjour": "fr",
         "merci": "fr",
+        "salut": "fr",
+
+        "danke": "de",
+        "bitte": "de",
 
         "hola": "es",
         "gracias": "es",
 
         "ciao": "it",
+        "grazie": "it",
 
+        "olá": "pt",
+        "ola": "pt",
         "obrigado": "pt",
         "obrigada": "pt",
 
         "merhaba": "tr",
+        "nasılsın": "tr",
+        "nasilsin": "tr",
 
         "habari": "sw",
+        "asante": "sw",
 
         "szia": "hu",
-
         "ahoj": "cs",
 
-        "hei": "fi",
-
+        "hei": "no",
         "takk": "no",
     }
 
-    for word, language in distinctive.items():
+    for word in words:
 
-        if word in words:
-            return language
+        if word in distinctive:
+            return distinctive[word]
 
     if scores:
 
-        best_language, best_score = max(
+        ranked = sorted(
             scores.items(),
-            key=lambda x: x[1]
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        best_language, best_score = ranked[0]
+
+        second_score = (
+            ranked[1][1]
+            if len(ranked) > 1
+            else 0
         )
 
         if best_score >= 2:
-            return best_language
+
+            if (
+                best_score > second_score
+                or best_score >= 3
+            ):
+                return best_language
+
+    english_words = {
+
+        "the", "is", "are", "am",
+        "you", "your", "how",
+        "what", "why", "where",
+        "when", "who",
+        "can", "could",
+        "would", "should",
+        "please", "help",
+        "hello", "hi", "hey",
+        "thanks", "thank",
+        "good", "morning",
+        "evening", "today",
+        "tomorrow", "yesterday",
+        "this", "that", "with",
+        "from", "for", "and",
+        "but", "not", "have",
+        "has", "had",
+        "do", "does", "did",
+        "want", "need",
+        "know", "tell",
+        "give", "make",
+        "computer", "project",
+        "code", "error",
+        "python",
+    }
+
+    english_score = len(
+        word_set.intersection(
+            english_words
+        )
+    )
+
+    if english_score >= 1:
+        return "en"
 
     return "en"
 
 
 # ============================================================
-# TEXT LANGUAGE
+# TEXT LANGUAGE DETECTION
 # ============================================================
-
-def detect_explicit_language_request(text):
-
-    """Detect direct requests such as 'banglay bolo' or 'answer in Hindi'."""
-
-    if not text:
-        return None
-
-    normalized = " ".join(normalize_words(text))
-
-    patterns = {
-        "bn": [
-            r"bangla(?:y|te)?\s+(?:bolo|bolun|dao|den|likho|lekho|answer|reply)",
-            r"banglish\s+(?:e|te)?\s*(?:bolo|answer|reply|dao)",
-            r"bengali\s+(?:te|in)?\s*(?:bolo|answer|reply)",
-            r"বাংলা(?:য়|য়|তে)?",
-        ],
-        "hi": [
-            r"hindi\s+(?:me|mein|mai|in)?\s*(?:bolo|batao|answer|reply|do)",
-            r"hinglish\s+(?:me|mein|e)?\s*(?:bolo|answer|reply)",
-            r"हिंदी\s*(?:में|मे)?",
-        ],
-        "en": [
-            r"(?:answer|reply|respond)\s+in\s+english",
-            r"english\s+(?:e|te|me)?\s*(?:bolo|answer|reply)",
-        ],
-        "ta": [r"tamil\s+(?:la|il|in)?\s*(?:answer|reply|bolo)", r"தமிழில்"],
-        "te": [r"telugu\s+(?:lo|in)?\s*(?:answer|reply|cheppu)", r"తెలుగులో"],
-        "or": [r"odia\s+(?:re|te)?\s*(?:answer|reply|bolo)", r"ଓଡ଼ିଆରେ"],
-        "mr": [r"marathi\s+(?:madhe|in)?\s*(?:answer|reply|sanga)", r"मराठीत"],
-        "gu": [r"gujarati\s+(?:ma|in)?\s*(?:answer|reply)", r"ગુજરાતીમાં"],
-    }
-
-    for language, expressions in patterns.items():
-        for expression in expressions:
-            if re.search(expression, text, flags=re.IGNORECASE):
-                return language
-
-    return None
-
 
 def detect_text_language(text):
 
-    if not text or not text.strip():
+    if not text:
         return "en"
 
-    explicit_language = detect_explicit_language_request(text)
-    if explicit_language in LANGUAGE_NAMES:
-        return explicit_language
+    text = str(text).strip()
 
-    script_language = detect_script_language(text)
+    if not text:
+        return "en"
+
+    script_language = detect_script_language(
+        text
+    )
 
     if script_language:
 
         if script_language == "ar":
 
-            if contains_urdu_specific_characters(text):
+            if contains_urdu_specific_characters(
+                text
+            ):
                 return "ur"
 
             return "ar"
 
         return script_language
 
-    return detect_roman_language(text)
-
-
-# ============================================================
-# LANGUAGE INSTRUCTION
-# ============================================================
-
-def get_language_instruction(language_code):
-
-    if language_code == "bn":
-
-        return """
-Answer in Bengali.
-
-If the current user question is written in Bengali script,
-answer in natural Bengali script.
-
-If the current user question is written in Romanized Bengali
-/Banglish, answer in natural Banglish using Roman letters.
-
-Do NOT automatically convert Banglish into Bengali script.
-Do NOT convert Bengali into English.
-"""
-
-    if language_code == "hi":
-
-        return """
-Answer in Hindi.
-
-If the current user question is written in Devanagari,
-answer in natural Hindi Devanagari.
-
-If the current user question is written in Romanized Hindi
-/Hinglish, answer in natural Hinglish using Roman letters.
-
-Do NOT automatically convert Hinglish into Devanagari.
-Do NOT convert Hindi into English.
-"""
-
-    if language_code == "en":
-
-        return """
-Answer in natural English.
-"""
-
-    language_name = LANGUAGE_NAMES.get(
-        language_code,
-        "English"
+    return detect_roman_language(
+        text
     )
-
-    return f"""
-Answer in {language_name}.
-
-Use the same natural language style as the CURRENT USER
-QUESTION.
-
-The uploaded source language must NOT override this.
-"""
 
 
 # ============================================================
@@ -796,220 +1055,414 @@ def load_whisper():
 
 
 # ============================================================
-# FFMPEG
+# FFMPEG CHECK
 # ============================================================
 
 def check_ffmpeg():
 
-    return shutil.which("ffmpeg") is not None
+    return shutil.which(
+        "ffmpeg"
+    ) is not None
 
 
-def convert_audio_to_wav(input_path):
+# ============================================================
+# AUDIO CONVERSION
+# ============================================================
+
+def convert_audio_to_wav(
+    input_path
+):
 
     if not check_ffmpeg():
 
         raise RuntimeError(
-            "FFmpeg is required. "
-            "Install FFmpeg and add it to PATH."
+            "FFmpeg was not found. "
+            "Please install FFmpeg and add it to PATH."
         )
 
     output_path = os.path.join(
+
         tempfile.gettempdir(),
-        f"audio_{uuid.uuid4().hex}.wav"
+
+        f"converted_{uuid.uuid4().hex}.wav"
     )
 
     command = [
+
         "ffmpeg",
         "-y",
+
         "-i",
         input_path,
-        "-vn",
-        "-ac",
-        "1",
+
         "-ar",
         "16000",
+
+        "-ac",
+        "1",
+
         "-c:a",
         "pcm_s16le",
+
         output_path,
     ]
 
     try:
 
-        subprocess.run(
+        result = subprocess.run(
+
             command,
+
             stdout=subprocess.PIPE,
+
             stderr=subprocess.PIPE,
+
+            text=True,
+
             timeout=120,
-            check=True,
         )
+
+        if result.returncode != 0:
+
+            raise RuntimeError(
+                result.stderr[-3000:]
+            )
+
+        if not os.path.exists(
+            output_path
+        ):
+
+            raise RuntimeError(
+                "FFmpeg did not create the WAV file."
+            )
 
         return output_path
 
-    except subprocess.CalledProcessError as e:
-
-        error_text = e.stderr.decode(
-            "utf-8",
-            errors="ignore"
-        )
+    except FileNotFoundError:
 
         raise RuntimeError(
-            f"FFmpeg audio conversion failed:\n{error_text[-2000:]}"
-        )
-
-    except subprocess.TimeoutExpired:
-
-        raise RuntimeError(
-            "FFmpeg audio conversion timed out."
+            "FFmpeg was not found."
         )
 
 
 # ============================================================
-# WHISPER TRANSCRIPTION
+# TRANSCRIBE AUDIO
 # ============================================================
 
 def transcribe_audio(
     model,
     audio_file,
-    return_segments=False
+    return_segments=False,
 ):
 
-    segments, info = model.transcribe(
+    try:
 
-        audio_file,
+        segments, info = model.transcribe(
 
-        language=None,
+            audio_file,
 
-        task="transcribe",
+            language=None,
 
-        beam_size=5,
+            task="transcribe",
 
-        best_of=5,
+            beam_size=5,
 
-        temperature=0,
+            best_of=5,
 
-        condition_on_previous_text=False,
+            temperature=0,
 
-        vad_filter=True,
+            condition_on_previous_text=False,
 
-        vad_parameters={
-            "min_silence_duration_ms": 500
-        },
-    )
+            vad_filter=True,
 
-    segment_data = []
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+            },
+        )
 
-    transcript_parts = []
+        segments = list(
+            segments
+        )
 
-    for segment in segments:
+        segment_data = []
 
-        text = segment.text.strip()
+        for segment in segments:
+
+            text = segment.text.strip()
+
+            if text:
+
+                segment_data.append({
+
+                    "start": float(
+                        segment.start
+                    ),
+
+                    "end": float(
+                        segment.end
+                    ),
+
+                    "text": text,
+                })
+
+        text = " ".join(
+
+            item["text"]
+
+            for item in segment_data
+
+        ).strip()
 
         if not text:
-            continue
 
-        transcript_parts.append(text)
+            return (
+                "en",
+                "",
+                []
+            ) if return_segments else (
+                "en",
+                ""
+            )
 
-        segment_data.append({
+        whisper_language = str(
+            getattr(
+                info,
+                "language",
+                "en"
+            )
+        ).strip().lower()
 
-            "start": float(
-                segment.start
-            ),
+        whisper_probability = float(
+            getattr(
+                info,
+                "language_probability",
+                0.0
+            ) or 0.0
+        )
 
-            "end": float(
-                segment.end
-            ),
+        whisper_map = {
+            "bh": "hi",
+        }
 
-            "text": text,
-        })
+        whisper_language = whisper_map.get(
+            whisper_language,
+            whisper_language
+        )
 
-    transcript = " ".join(
-        transcript_parts
-    ).strip()
+        if whisper_language not in LANGUAGE_NAMES:
+            whisper_language = "en"
 
-    whisper_language = getattr(
-        info,
-        "language",
-        "en"
-    )
+        text_language = detect_text_language(
+            text
+        )
 
-    whisper_probability = getattr(
-        info,
-        "language_probability",
-        0
-    )
-
-    if whisper_language == "bh":
-        whisper_language = "hi"
-
-    text_language = detect_text_language(
-        transcript
-    )
-
-    script_language = detect_script_language(
-        transcript
-    )
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Roman Bengali/Hindi detection gets priority
-    # over Whisper's generic language prediction.
-    # --------------------------------------------------------
-
-    if script_language:
-
-        final_language = script_language
-
-    elif text_language in {
-        "bn",
-        "hi",
-    }:
-
-        final_language = text_language
-
-    elif (
-        whisper_language in LANGUAGE_NAMES
-        and
-        whisper_probability >= 0.60
-    ):
-
-        final_language = whisper_language
-
-    elif text_language in LANGUAGE_NAMES:
-
-        final_language = text_language
-
-    else:
+        script_language = detect_script_language(
+            text
+        )
 
         final_language = "en"
 
-    print("=" * 70)
-    print("WHISPER LANGUAGE:", whisper_language)
-    print("WHISPER PROBABILITY:", whisper_probability)
-    print("TEXT LANGUAGE:", text_language)
-    print("SCRIPT LANGUAGE:", script_language)
-    print("FINAL LANGUAGE:", final_language)
-    print("TRANSCRIPT:", transcript)
-    print("=" * 70)
+        if script_language == "bn":
 
-    if return_segments:
+            final_language = "bn"
+
+        elif script_language == "hi":
+
+            if (
+                whisper_language == "ne"
+                and whisper_probability >= 0.45
+            ):
+
+                final_language = "ne"
+
+            else:
+
+                final_language = "hi"
+
+        elif script_language in {
+
+            "pa",
+            "gu",
+            "or",
+            "ta",
+            "te",
+            "kn",
+            "ml",
+
+        }:
+
+            final_language = script_language
+
+        elif script_language == "ar":
+
+            if (
+                whisper_language == "ur"
+                and whisper_probability >= 0.40
+            ):
+
+                final_language = "ur"
+
+            elif text_language == "ur":
+
+                final_language = "ur"
+
+            else:
+
+                final_language = "ar"
+
+        elif script_language == "ja":
+
+            final_language = "ja"
+
+        elif script_language == "ko":
+
+            final_language = "ko"
+
+        elif script_language == "zh":
+
+            final_language = "zh"
+
+        elif script_language == "el":
+
+            final_language = "el"
+
+        elif script_language == "he":
+
+            final_language = "he"
+
+        elif script_language == "ru":
+
+            cyrillic_languages = {
+                "ru",
+                "uk",
+                "bg",
+                "sr",
+            }
+
+            if (
+                whisper_language
+                in cyrillic_languages
+                and whisper_probability >= 0.45
+            ):
+
+                final_language = (
+                    whisper_language
+                )
+
+            else:
+
+                final_language = "ru"
+
+        elif script_language == "th":
+
+            final_language = "th"
+
+        else:
+
+            if text_language != "en":
+
+                if whisper_language == text_language:
+
+                    final_language = (
+                        text_language
+                    )
+
+                elif (
+                    whisper_language != "en"
+                    and whisper_probability >= 0.70
+                ):
+
+                    final_language = (
+                        whisper_language
+                    )
+
+                else:
+
+                    final_language = (
+                        text_language
+                    )
+
+            elif (
+                whisper_language != "en"
+                and whisper_probability >= 0.45
+            ):
+
+                final_language = (
+                    whisper_language
+                )
+
+            else:
+
+                final_language = "en"
+
+        if final_language not in LANGUAGE_NAMES:
+
+            final_language = "en"
+
+        print("=" * 70)
+        print("VOICE LANGUAGE DETECTION")
+        print("=" * 70)
+
+        print(
+            f"Whisper language    : "
+            f"{whisper_language}"
+        )
+
+        print(
+            f"Whisper probability : "
+            f"{whisper_probability:.3f}"
+        )
+
+        print(
+            f"Transcript          : "
+            f"{text}"
+        )
+
+        print(
+            f"Text language       : "
+            f"{text_language}"
+        )
+
+        print(
+            f"Script language     : "
+            f"{script_language}"
+        )
+
+        print(
+            f"FINAL LANGUAGE      : "
+            f"{final_language}"
+        )
+
+        print("=" * 70)
+
+        if return_segments:
+
+            return (
+                final_language,
+                text,
+                segment_data
+            )
 
         return (
             final_language,
-            transcript,
-            segment_data,
+            text
         )
 
-    return (
-        final_language,
-        transcript,
-    )
+    except Exception as e:
+
+        raise RuntimeError(
+            "Whisper transcription failed: "
+            f"{repr(e)}"
+        )
 
 
 # ============================================================
 # FILE HASH
 # ============================================================
 
-def get_file_hash(file_bytes):
+def get_file_hash(
+    file_bytes
+):
 
     return hashlib.sha256(
         file_bytes
@@ -1017,49 +1470,44 @@ def get_file_hash(file_bytes):
 
 
 # ============================================================
-# PDF EXTRACTION
+# PDF TEXT + PAGE INFORMATION
 # ============================================================
 
-def extract_pdf_data(file_bytes):
+def extract_pdf_data(
+    file_bytes
+):
+
+    pdf_document = pymupdf.open(
+        stream=file_bytes,
+        filetype="pdf"
+    )
 
     pages = []
 
-    try:
+    for index in range(
+        len(pdf_document)
+    ):
 
-        document = fitz.open(
-            stream=file_bytes,
-            filetype="pdf"
-        )
+        page = pdf_document[index]
 
-        for index, page in enumerate(document):
+        text = page.get_text(
+            "text"
+        ).strip()
 
-            text = page.get_text(
-                "text"
-            ).strip()
+        pages.append({
 
-            pages.append({
+            "page_number": index + 1,
 
-                "page_number":
-                index + 1,
+            "text": text,
+        })
 
-                "text":
-                text,
-            })
-
-        document.close()
-
-    except Exception as e:
-
-        print(
-            "PDF extraction error:",
-            repr(e)
-        )
+    pdf_document.close()
 
     return pages
 
 
 # ============================================================
-# PDF PAGE RENDER
+# PDF PAGE SCREENSHOT
 # ============================================================
 
 def render_pdf_page(
@@ -1067,280 +1515,114 @@ def render_pdf_page(
     page_number
 ):
 
-    try:
+    pdf_document = pymupdf.open(
+        stream=file_bytes,
+        filetype="pdf"
+    )
 
-        document = fitz.open(
-            stream=file_bytes,
-            filetype="pdf"
-        )
+    index = page_number - 1
 
-        index = page_number - 1
+    if (
+        index < 0
+        or index >= len(pdf_document)
+    ):
 
-        if index < 0 or index >= len(document):
-
-            document.close()
-            return None
-
-        page = document[index]
-
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(1.6, 1.6),
-            alpha=False
-        )
-
-        image_bytes = pix.tobytes(
-            "png"
-        )
-
-        document.close()
-
-        return image_bytes
-
-    except Exception as e:
-
-        print(
-            "PDF render error:",
-            repr(e)
-        )
+        pdf_document.close()
 
         return None
 
+    page = pdf_document[index]
 
-# ============================================================
-# PDF RELEVANT CROP
-# ============================================================
+    matrix = pymupdf.Matrix(
+        1.6,
+        1.6
+    )
 
-def render_pdf_relevant_crop(
-    file_bytes,
-    page_number,
-    question,
-    padding=30
-):
+    pixmap = page.get_pixmap(
+        matrix=matrix,
+        alpha=False
+    )
 
-    try:
+    image_bytes = pixmap.tobytes(
+        "png"
+    )
 
-        document = fitz.open(
-            stream=file_bytes,
-            filetype="pdf"
-        )
+    pdf_document.close()
 
-        page = document[
-            page_number - 1
-        ]
-
-        words = page.get_text(
-            "words"
-        )
-
-        question_tokens = set(
-            relevance_tokens(question)
-        )
-
-        matched_rects = []
-
-        for word in words:
-
-            word_text = str(
-                word[4]
-            ).lower()
-
-            normalized = set(
-                normalize_words(
-                    word_text
-                )
-            )
-
-            if normalized.intersection(
-                question_tokens
-            ):
-
-                matched_rects.append(
-                    fitz.Rect(
-                        word[0],
-                        word[1],
-                        word[2],
-                        word[3],
-                    )
-                )
-
-        if matched_rects:
-
-            rect = matched_rects[0]
-
-            for current in matched_rects[1:]:
-                rect |= current
-
-        else:
-
-            blocks = page.get_text(
-                "blocks"
-            )
-
-            best_score = -1
-            best_rect = None
-
-            for block in blocks:
-
-                block_text = block[4]
-
-                score = calculate_relevance(
-                    question,
-                    block_text
-                )
-
-                if score > best_score:
-
-                    best_score = score
-
-                    best_rect = fitz.Rect(
-                        block[:4]
-                    )
-
-            rect = (
-                best_rect
-                if best_rect
-                else page.rect
-            )
-
-        rect.x0 = max(
-            page.rect.x0,
-            rect.x0 - padding
-        )
-
-        rect.y0 = max(
-            page.rect.y0,
-            rect.y0 - padding
-        )
-
-        rect.x1 = min(
-            page.rect.x1,
-            rect.x1 + padding
-        )
-
-        rect.y1 = min(
-            page.rect.y1,
-            rect.y1 + padding
-        )
-
-        # Avoid extremely tiny crop
-        if rect.width < 100:
-            rect.x1 = min(
-                page.rect.x1,
-                rect.x0 + 100
-            )
-
-        if rect.height < 60:
-            rect.y1 = min(
-                page.rect.y1,
-                rect.y0 + 60
-            )
-
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(2, 2),
-            clip=rect,
-            alpha=False
-        )
-
-        image_bytes = pix.tobytes(
-            "png"
-        )
-
-        document.close()
-
-        return image_bytes
-
-    except Exception as e:
-
-        print(
-            "PDF crop error:",
-            repr(e)
-        )
-
-        return None
+    return image_bytes
 
 
 # ============================================================
-# DOCX EXTRACTION
+# DOCX TEXT
 # ============================================================
 
 def extract_text_from_docx(
     file_bytes
 ):
 
-    temp_path = None
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".docx"
+    ) as tmp:
+
+        tmp.write(
+            file_bytes
+        )
+
+        tmp_path = tmp.name
 
     try:
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".docx"
-        ) as tmp:
-
-            tmp.write(file_bytes)
-
-            temp_path = tmp.name
-
         document = Document(
-            temp_path
+            tmp_path
         )
 
         parts = []
 
         for paragraph in document.paragraphs:
 
-            text = paragraph.text.strip()
+            if paragraph.text.strip():
 
-            if text:
-                parts.append(text)
+                parts.append(
+                    paragraph.text
+                )
 
         for table in document.tables:
 
             for row in table.rows:
 
-                row_text = []
+                row_text = " | ".join(
 
-                for cell in row.cells:
+                    cell.text.strip()
 
-                    cell_text = cell.text.strip()
+                    for cell in row.cells
 
-                    if cell_text:
-                        row_text.append(
-                            cell_text
-                        )
+                    if cell.text.strip()
+                )
 
                 if row_text:
 
                     parts.append(
-                        " | ".join(row_text)
+                        row_text
                     )
 
-        return "\n".join(parts).strip()
-
-    except Exception as e:
-
-        print(
-            "DOCX extraction error:",
-            repr(e)
-        )
-
-        return ""
+        return "\n".join(
+            parts
+        ).strip()
 
     finally:
 
-        if (
-            temp_path
-            and
-            os.path.exists(temp_path)
-        ):
+        try:
+            os.remove(
+                tmp_path
+            )
 
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 
 # ============================================================
-# OFFICE -> PDF
+# CONVERT OFFICE FILE TO PDF
 # ============================================================
 
 def convert_office_to_pdf(
@@ -1348,22 +1630,38 @@ def convert_office_to_pdf(
     extension
 ):
 
-    office_binary = (
+    soffice = (
         shutil.which("soffice")
         or
         shutil.which("libreoffice")
     )
 
-    if not office_binary:
+    if not soffice:
+
+        print(
+            "LibreOffice/soffice not found."
+        )
+
         return None
 
-    temp_dir = tempfile.mkdtemp(
-        prefix="office_convert_"
+    source_path = os.path.join(
+
+        tempfile.gettempdir(),
+
+        f"office_{uuid.uuid4().hex}"
+        f"{extension}"
     )
 
-    source_path = os.path.join(
-        temp_dir,
-        f"source{extension}"
+    output_dir = os.path.join(
+
+        tempfile.gettempdir(),
+
+        f"office_pdf_{uuid.uuid4().hex}"
+    )
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True
     )
 
     try:
@@ -1377,54 +1675,70 @@ def convert_office_to_pdf(
                 file_bytes
             )
 
-        subprocess.run(
+        command = [
 
-            [
-                office_binary,
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir,
-                source_path,
-            ],
+            soffice,
+
+            "--headless",
+
+            "--convert-to",
+            "pdf",
+
+            "--outdir",
+            output_dir,
+
+            source_path,
+        ]
+
+        result = subprocess.run(
+
+            command,
 
             stdout=subprocess.PIPE,
+
             stderr=subprocess.PIPE,
 
-            timeout=120,
+            text=True,
 
-            check=True,
+            timeout=120,
         )
 
-        output_path = os.path.join(
-            temp_dir,
-            "source.pdf"
+        print(
+            "LibreOffice stdout:",
+            result.stdout
+        )
+
+        print(
+            "LibreOffice stderr:",
+            result.stderr
+        )
+
+        if result.returncode != 0:
+
+            return None
+
+        pdf_name = (
+            Path(source_path).stem
+            + ".pdf"
+        )
+
+        pdf_path = os.path.join(
+            output_dir,
+            pdf_name
         )
 
         if not os.path.exists(
-            output_path
+            pdf_path
         ):
 
-            pdf_files = list(
-                Path(temp_dir).glob(
-                    "*.pdf"
-                )
-            )
-
-            if not pdf_files:
-                return None
-
-            output_path = str(
-                pdf_files[0]
-            )
+            return None
 
         with open(
-            output_path,
+            pdf_path,
             "rb"
-        ) as file:
+        ) as pdf_file:
 
-            return file.read()
+            return pdf_file.read()
 
     except Exception as e:
 
@@ -1437,56 +1751,82 @@ def convert_office_to_pdf(
 
     finally:
 
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True
-        )
+        try:
+
+            if os.path.exists(
+                source_path
+            ):
+
+                os.remove(
+                    source_path
+                )
+
+        except Exception:
+            pass
+
+        try:
+
+            if os.path.exists(
+                output_dir
+            ):
+
+                shutil.rmtree(
+                    output_dir,
+                    ignore_errors=True
+                )
+
+        except Exception:
+            pass
 
 
 # ============================================================
-# GENERIC PDF PAGES
+# GENERIC PDF DATA
 # ============================================================
 
 def extract_pages_from_pdf_bytes(
     file_bytes
 ):
 
-    pages = []
-
     try:
 
-        document = fitz.open(
+        document = pymupdf.open(
             stream=file_bytes,
             filetype="pdf"
         )
 
-        for index, page in enumerate(document):
+        pages = []
+
+        for index in range(
+            len(document)
+        ):
+
+            page = document[index]
 
             pages.append({
 
-                "page_number":
-                index + 1,
+                "page_number": index + 1,
 
-                "text":
-                page.get_text(
+                "text": page.get_text(
                     "text"
                 ).strip(),
             })
 
         document.close()
 
+        return pages
+
     except Exception as e:
 
         print(
-            "Converted PDF extraction error:",
+            "PDF page extraction error:",
             repr(e)
         )
 
-    return pages
+        return []
 
 
 # ============================================================
-# VIDEO
+# VIDEO TEMP FILE
 # ============================================================
 
 def save_video_to_temp(
@@ -1495,39 +1835,58 @@ def save_video_to_temp(
 ):
 
     path = os.path.join(
+
         tempfile.gettempdir(),
-        f"video_{uuid.uuid4().hex}{extension}"
+
+        f"video_{uuid.uuid4().hex}"
+        f"{extension}"
     )
 
     with open(
         path,
         "wb"
-    ) as file:
+    ) as video:
 
-        file.write(
+        video.write(
             file_bytes
         )
 
     return path
 
 
+# ============================================================
+# EXTRACT VIDEO FRAME
+# ============================================================
+
 def extract_video_frame(
     video_path,
     timestamp
 ):
 
+    if not check_ffmpeg():
+
+        return None
+
     output_path = os.path.join(
+
         tempfile.gettempdir(),
+
         f"frame_{uuid.uuid4().hex}.jpg"
     )
 
     command = [
 
         "ffmpeg",
+
         "-y",
 
         "-ss",
-        str(max(0, timestamp)),
+        str(
+            max(
+                0,
+                timestamp
+            )
+        ),
 
         "-i",
         video_path,
@@ -1543,16 +1902,25 @@ def extract_video_frame(
 
     try:
 
-        subprocess.run(
+        result = subprocess.run(
+
             command,
+
             stdout=subprocess.PIPE,
+
             stderr=subprocess.PIPE,
-            timeout=60,
-            check=True,
+
+            text=True,
+
+            timeout=30,
         )
 
-        if not os.path.exists(
-            output_path
+        if (
+            result.returncode != 0
+            or
+            not os.path.exists(
+                output_path
+            )
         ):
 
             return None
@@ -1560,49 +1928,56 @@ def extract_video_frame(
         with open(
             output_path,
             "rb"
-        ) as file:
+        ) as frame:
 
-            data = file.read()
+            data = frame.read()
 
         return data
 
-    except Exception as e:
-
-        print(
-            "Video frame extraction error:",
-            repr(e)
-        )
+    except Exception:
 
         return None
 
     finally:
 
-        if os.path.exists(
-            output_path
-        ):
+        try:
 
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+            if os.path.exists(
+                output_path
+            ):
+
+                os.remove(
+                    output_path
+                )
+
+        except Exception:
+            pass
 
 
-def format_timestamp(seconds):
+# ============================================================
+# FORMAT TIMESTAMP
+# ============================================================
 
-    seconds = max(
-        0,
-        float(seconds)
+def format_timestamp(
+    seconds
+):
+
+    seconds = int(
+        max(
+            0,
+            seconds
+        )
     )
 
-    hours = int(
+    hours = (
         seconds // 3600
     )
 
-    minutes = int(
-        (seconds % 3600) // 60
-    )
+    minutes = (
+        seconds % 3600
+    ) // 60
 
-    secs = int(
+    secs = (
         seconds % 60
     )
 
@@ -1621,94 +1996,114 @@ def format_timestamp(seconds):
 
 
 # ============================================================
-# RELEVANCE
+# RELEVANCE TOKENIZER
 # ============================================================
 
 STOP_WORDS = {
 
-    "the", "a", "an", "is", "are",
-    "was", "were", "am", "be",
-    "to", "of", "in", "on", "for",
-    "and", "or", "but", "with",
-    "this", "that", "it", "as",
-    "at", "by", "from",
+    "the", "is", "are", "was", "were",
+    "a", "an", "and", "or", "of", "to",
+    "in", "on", "for", "with", "from",
+    "this", "that", "what", "why",
+    "how", "where", "when", "who",
+    "which", "can", "could", "would",
+    "please", "tell", "me",
 
-    "ami", "amar", "amake",
-    "tumi", "tomar", "tomake",
-    "apni", "apnar",
-    "ki", "kothay", "kivabe",
-    "ache", "achi", "acho",
-    "kor", "koro", "korbo",
-    "bolo", "dao",
+    "ami", "amar", "tumi", "tomar",
+    "ki", "kivabe", "kothay", "keno",
+    "eta", "ota", "ei", "oi",
+    "theke", "niye", "bolo", "dao",
 
-    "main", "mera", "mujhe",
-    "aap", "aapko", "tum",
-    "kya", "kaise", "kahan",
-    "hai", "hain", "hoon",
-    "kar", "karo", "batao",
+    "mujhe", "mera", "meri", "kya",
+    "kaise", "kahan", "kyun",
 }
 
 
-def relevance_tokens(text):
+def relevance_tokens(
+    text
+):
 
     words = normalize_words(
         text
     )
 
-    return [
+    return {
 
         word
 
         for word in words
 
-        if len(word) >= 2
-        and word not in STOP_WORDS
-    ]
+        if (
+            len(word) >= 2
+            and word not in STOP_WORDS
+        )
+    }
 
+
+# ============================================================
+# RELEVANCE SCORE
+# ============================================================
 
 def calculate_relevance(
     question,
     content
 ):
 
-    if not question or not content:
+    if not content:
+
         return 0
 
-    question_tokens = set(
-        relevance_tokens(question)
+    q_tokens = relevance_tokens(
+        question
     )
 
-    content_tokens = set(
-        relevance_tokens(content)
+    c_tokens = relevance_tokens(
+        content
     )
 
-    overlap = question_tokens.intersection(
-        content_tokens
+    if not q_tokens or not c_tokens:
+
+        return 0
+
+    overlap = len(
+        q_tokens.intersection(
+            c_tokens
+        )
     )
 
-    score = len(overlap) * 2
+    phrase_bonus = 0
 
-    normalized_question = " ".join(
-        normalize_words(question)
+    question_normalized = " ".join(
+        normalize_words(
+            question
+        )
     )
 
-    normalized_content = " ".join(
-        normalize_words(content)
+    content_normalized = " ".join(
+        normalize_words(
+            content
+        )
     )
 
     if (
-        normalized_question
+        len(question_normalized) > 8
         and
-        len(normalized_question) > 5
-        and
-        normalized_question
-        in normalized_content
+        question_normalized
+        in content_normalized
     ):
 
-        score += 5
+        phrase_bonus = 5
 
-    return score
+    return (
+        overlap * 2
+        +
+        phrase_bonus
+    )
 
+
+# ============================================================
+# FIND RELEVANT PDF PAGES
+# ============================================================
 
 def find_relevant_pdf_pages(
     question,
@@ -1717,6 +2112,7 @@ def find_relevant_pdf_pages(
 ):
 
     if not pages:
+
         return []
 
     scored = []
@@ -1724,8 +2120,13 @@ def find_relevant_pdf_pages(
     for page in pages:
 
         score = calculate_relevance(
+
             question,
-            page.get("text", "")
+
+            page.get(
+                "text",
+                ""
+            )
         )
 
         scored.append(
@@ -1740,2383 +2141,574 @@ def find_relevant_pdf_pages(
         reverse=True
     )
 
-    positive = [
-        page
-        for score, page in scored
-        if score > 0
-    ]
+    selected = []
 
-    if positive:
-        return positive[:max_pages]
+    for score, page in scored:
 
-    return [
-        page
-        for _, page
-        in scored[:max_pages]
-    ]
+        if score <= 0:
 
+            continue
 
-def find_relevant_video_segments(
-    question,
-    segments,
-    max_segments=2
-):
-
-    if not segments:
-        return []
-
-    scored = []
-
-    for segment in segments:
-
-        score = calculate_relevance(
-            question,
-            segment.get(
-                "text",
-                ""
-            )
+        selected.append(
+            page
         )
 
-        scored.append(
-            (
-                score,
-                segment
-            )
-        )
+        if len(selected) >= max_pages:
 
-    scored.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
+            break
 
-    positive = [
-        segment
-        for score, segment in scored
-        if score > 0
-    ]
+    # IMPORTANT:
+    # Even if relevance score is zero,
+    # still return the best available pages.
 
-    if positive:
-        return positive[:max_segments]
+    if not selected:
 
-    return [
-        segment
-        for _, segment
-        in scored[:max_segments]
-    ]
+        selected = [
+
+            page
+
+            for _, page in scored[
+                :max_pages
+            ]
+        ]
+
+    return selected
 
 
 # ============================================================
-# WEBSITE HELPERS
+# WEBSITE TEXT EXTRACTION
+# ============================================================
+
+# ============================================================
+# GENERIC WEBSITE ACCESS + LOGIN + CRAWLING
 # ============================================================
 
 AUTH_KEYWORDS = {
-
-    "login",
-    "log in",
-    "signin",
-    "sign in",
-    "authenticate",
-    "authentication",
-    "account",
-    "username",
-    "email",
-    "password",
+    "login", "log in", "signin", "sign in", "authenticate",
+    "authentication", "account", "username", "email", "password",
 }
-
 
 SECURITY_CHALLENGE_KEYWORDS = {
-
-    "captcha",
-    "recaptcha",
-    "verification code",
-    "verify code",
-    "one-time password",
-    "otp",
-    "two-factor",
-    "2fa",
-    "authenticator",
-    "security code",
-    "passkey",
+    "captcha", "recaptcha", "verification code", "verify code",
+    "one-time password", "otp", "two-factor", "2fa", "authenticator",
+    "security code", "passkey",
 }
 
 
-def normalize_url(
-    url,
-    base_url=None
-):
-
+def normalize_url(url, base_url=None):
+    url = (url or "").strip()
     if not url:
-        return None
-
-    url = str(url).strip()
-
+        return ""
     if base_url:
-        url = urljoin(
-            base_url,
-            url
-        )
-
-    url, _ = urldefrag(
-        url
-    )
-
-    if not re.match(
-        r"^https?://",
-        url,
-        re.IGNORECASE
-    ):
-
+        url = urljoin(base_url, url)
+    url, _ = urldefrag(url)
+    if not url.startswith(("http://", "https://")):
         url = "https://" + url
-
-    parsed = urlparse(
-        url
-    )
-
-    if not parsed.netloc:
-        return None
-
-    parsed = parsed._replace(
-        path=parsed.path or "/",
-        fragment=""
-    )
-
-    return parsed.geturl()
+    parsed = urlparse(url)
+    return parsed._replace(path=parsed.path or "/", fragment="").geturl()
 
 
-def same_domain(
-    url1,
-    url2
-):
-
+def same_domain(url1, url2):
     try:
-
-        host1 = (
-            urlparse(url1)
-            .netloc
-            .lower()
-            .split(":")[0]
-            .removeprefix("www.")
-        )
-
-        host2 = (
-            urlparse(url2)
-            .netloc
-            .lower()
-            .split(":")[0]
-            .removeprefix("www.")
-        )
-
-        return host1 == host2
-
+        d1 = urlparse(url1).netloc.lower().split(":")[0]
+        d2 = urlparse(url2).netloc.lower().split(":")[0]
+        if d1.startswith("www."):
+            d1 = d1[4:]
+        if d2.startswith("www."):
+            d2 = d2[4:]
+        return d1 == d2
     except Exception:
         return False
 
 
 def is_crawlable_url(url):
-
     if not url:
         return False
-
-    lowered = url.lower()
-
-    blocked_prefixes = (
-        "mailto:",
-        "tel:",
-        "javascript:",
-        "data:",
-        "whatsapp:",
-    )
-
-    if lowered.startswith(
-        blocked_prefixes
-    ):
-
+    lower = url.lower()
+    if lower.startswith(("mailto:", "tel:", "javascript:", "data:", "whatsapp:")):
         return False
-
-    blocked_extensions = (
-
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".webp",
-        ".svg",
-
-        ".mp3",
-        ".wav",
-        ".mp4",
-        ".mov",
-        ".avi",
-
-        ".zip",
-        ".rar",
-        ".7z",
-
-        ".exe",
-        ".dmg",
-
-        ".pdf",
-        ".doc",
-        ".docx",
-        ".xls",
-        ".xlsx",
-        ".ppt",
-        ".pptx",
+    blocked = (
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+        ".mp4", ".mp3", ".wav", ".avi", ".mov", ".zip", ".rar",
+        ".7z", ".exe", ".dmg", ".pdf", ".doc", ".docx", ".xls",
+        ".xlsx", ".ppt", ".pptx",
     )
-
-    path = urlparse(
-        lowered
-    ).path
-
-    return not path.endswith(
-        blocked_extensions
-    )
+    return not urlparse(lower).path.endswith(blocked)
 
 
 def clean_website_text(text):
-
-    if not text:
-        return ""
-
-    return re.sub(
-        r"\s+",
-        " ",
-        str(text)
-    ).strip()
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def _visible_locator(
-    page,
-    selectors
-):
-
+def _visible_locator(page, selectors):
     for selector in selectors:
-
         try:
+            loc = page.locator(selector)
+            for i in range(min(loc.count(), 10)):
+                item = loc.nth(i)
+                if item.is_visible() and item.is_enabled():
+                    return item
+        except Exception:
+            continue
+    return None
 
-            locator = page.locator(
-                selector
+
+def detect_security_challenge(page):
+    try:
+        text = page.locator("body").inner_text(timeout=5000).lower()
+    except Exception:
+        text = ""
+    return [k for k in SECURITY_CHALLENGE_KEYWORDS if k in text]
+
+
+def inspect_website_access(url):
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"success": False, "requires_login": False,
+                "error": "Playwright is unavailable. Run: playwright install chromium"}
+    url = normalize_url(url)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 1000},
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/138.0 Safari/537.36"),
             )
-
-            count = min(
-                locator.count(),
-                10
-            )
-
-            for index in range(count):
-
-                element = locator.nth(
-                    index
+            page = context.new_page()
+            response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1200)
+            final_url = normalize_url(page.url)
+            try:
+                title = page.title()
+            except Exception:
+                title = ""
+            try:
+                body = page.locator("body").inner_text(timeout=5000)
+            except Exception:
+                body = ""
+            lower_url = final_url.lower()
+            lower = (lower_url + " " + title.lower() + " " + body[:12000].lower())
+            password_visible = False
+            try:
+                pw = page.locator("input[type='password']")
+                for i in range(min(pw.count(), 10)):
+                    if pw.nth(i).is_visible():
+                        password_visible = True
+                        break
+            except Exception:
+                pass
+            login_url = None
+            try:
+                anchors = page.locator("a[href]").evaluate_all(
+                    "els => els.map(a => ({href:a.href,text:(a.innerText||'').trim()}))"
                 )
+                for item in anchors:
+                    href = item.get("href", "")
+                    text = item.get("text", "").lower()
+                    combined = (href.lower() + " " + text)
+                    if any(k in combined for k in AUTH_KEYWORDS):
+                        candidate = normalize_url(href, final_url)
+                        if candidate and same_domain(candidate, final_url):
+                            login_url = candidate
+                            break
+            except Exception:
+                pass
+            status_login = False
+            try:
+                status_login = bool(response and response.status in (401, 403))
+            except Exception:
+                pass
+            redirected = any(x in lower_url for x in ("/login", "/signin", "/sign-in", "/authenticate"))
+            auth_context = any(k in lower for k in AUTH_KEYWORDS)
+            requires_login = status_login or redirected or (password_visible and auth_context)
+            if requires_login and not login_url:
+                login_url = final_url
+            browser.close()
+            return {"success": True, "requires_login": requires_login,
+                    "login_url": login_url, "final_url": final_url, "title": title}
+    except Exception as e:
+        return {"success": False, "requires_login": False, "error": str(e)}
 
+
+def login_to_website(login_url, login_id, login_password):
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"success": False, "manual_required": False,
+                "message": "Playwright is unavailable."}
+    login_url = normalize_url(login_url)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1440, "height": 1000},
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/138.0 Safari/537.36"),
+            )
+            page = context.new_page()
+            page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+
+            challenge = detect_security_challenge(page)
+            if challenge:
+                browser.close()
+                return {"success": False, "manual_required": True,
+                        "message": "This website requires CAPTCHA/OTP/2FA/additional verification. Complete it manually."}
+
+            password_field = _visible_locator(page, [
+                "input[type='password']",
+                "input[name*='password' i]",
+                "input[autocomplete='current-password']",
+            ])
+            if password_field is None:
+                browser.close()
+                return {"success": False, "manual_required": False,
+                        "message": "Could not find the website password field."}
+
+            username_field = _visible_locator(page, [
+                "input[autocomplete='username']",
+                "input[type='email']",
+                "input[name*='email' i]",
+                "input[name*='username' i]",
+                "input[name*='user' i]",
+                "input[name*='login' i]",
+                "input[type='text']",
+            ])
+            if username_field is None:
+                browser.close()
+                return {"success": False, "manual_required": False,
+                        "message": "Could not find Login ID/Email/Username field."}
+
+            username_field.fill(str(login_id))
+            password_field.fill(str(login_password))
+
+            clicked = False
+            for selector in [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button",
+            ]:
                 try:
-
-                    if (
-                        element.is_visible()
-                        and
-                        element.is_enabled()
-                    ):
-
-                        return element
-
+                    loc = page.locator(selector)
+                    for i in range(min(loc.count(), 15)):
+                        btn = loc.nth(i)
+                        if not btn.is_visible() or not btn.is_enabled():
+                            continue
+                        ok = btn.evaluate("""
+                            el => {
+                                const t=(el.innerText||el.value||'').toLowerCase();
+                                return el.type==='submit' ||
+                                    t.includes('login') || t.includes('log in') ||
+                                    t.includes('sign in') || t.includes('signin') ||
+                                    t.includes('continue') || t.includes('submit');
+                            }
+                        """)
+                        if ok:
+                            btn.click(timeout=10000)
+                            clicked = True
+                            break
+                    if clicked:
+                        break
                 except Exception:
                     continue
 
-        except Exception:
-            continue
-
-    return None
-
-
-def detect_security_challenge(
-    page
-):
-
-    try:
-
-        body = page.locator(
-            "body"
-        ).inner_text(
-            timeout=3000
-        ).lower()
-
-    except Exception:
-
-        return None
-
-    for keyword in SECURITY_CHALLENGE_KEYWORDS:
-
-        if keyword in body:
-            return keyword
-
-    return None
-
-
-# ============================================================
-# INSPECT WEBSITE ACCESS
-# ============================================================
-
-def inspect_website_access(url):
-
-    normalized = normalize_url(
-        url
-    )
-
-    result = {
-
-        "requires_login": False,
-
-        "login_url":
-        normalized,
-
-        "final_url":
-        normalized,
-
-        "status_code":
-        None,
-
-        "error":
-        None,
-    }
-
-    if not normalized:
-
-        result["error"] = (
-            "Invalid website URL."
-        )
-
-        return result
-
-    # --------------------------------------------------------
-    # Without Playwright
-    # --------------------------------------------------------
-
-    if not PLAYWRIGHT_AVAILABLE:
-
-        try:
-
-            response = requests.get(
-                normalized,
-                timeout=20,
-                headers={
-                    "User-Agent":
-                    "Mozilla/5.0"
-                },
-                allow_redirects=True,
-            )
-
-            result["status_code"] = (
-                response.status_code
-            )
-
-            result["final_url"] = (
-                response.url
-            )
-
-            if response.status_code in {
-                401,
-                403,
-            }:
-
-                result[
-                    "requires_login"
-                ] = True
-
-            return result
-
-        except Exception as e:
-
-            result["error"] = repr(e)
-
-            return result
-
-    # --------------------------------------------------------
-    # Playwright
-    # --------------------------------------------------------
-
-    try:
-
-        with sync_playwright() as p:
-
-            browser = p.chromium.launch(
-                headless=True
-            )
-
-            context = browser.new_context(
-                viewport={
-                    "width": 1440,
-                    "height": 1000,
-                }
-            )
-
-            page = context.new_page()
-
-            response = page.goto(
-
-                normalized,
-
-                wait_until="domcontentloaded",
-
-                timeout=WEBSITE_TIMEOUT
-            )
-
-            try:
-
-                page.wait_for_load_state(
-                    "networkidle",
-                    timeout=10000
-                )
-
-            except Exception:
-                pass
-
-            result["final_url"] = page.url
-
-            if response:
-
-                result["status_code"] = (
-                    response.status
-                )
-
-            current = page.url.lower()
-
-            body = ""
-
-            try:
-
-                body = page.locator(
-                    "body"
-                ).inner_text(
-                    timeout=3000
-                ).lower()
-
-            except Exception:
-                pass
-
-            login_path = any(
-                path in current
-                for path in (
-                    "/login",
-                    "/signin",
-                    "/sign-in",
-                    "/authenticate",
-                )
-            )
-
-            has_password = (
-                page.locator(
-                    "input[type='password']"
-                ).count() > 0
-            )
-
-            has_login_keyword = any(
-                keyword in body
-                for keyword in (
-                    "sign in",
-                    "log in",
-                    "login",
-                    "password",
-                )
-            )
-
-            if (
-                login_path
-                or
-                (
-                    has_password
-                    and
-                    has_login_keyword
-                )
-                or
-                result["status_code"]
-                in {401, 403}
-            ):
-
-                result[
-                    "requires_login"
-                ] = True
-
-                result[
-                    "login_url"
-                ] = page.url
-
-            context.close()
-            browser.close()
-
-    except Exception as e:
-
-        result["error"] = repr(e)
-
-    return result
-
-
-# ============================================================
-# WEBSITE LOGIN
-# ============================================================
-
-def login_to_website(
-    login_url,
-    login_id,
-    login_password
-):
-
-    if not PLAYWRIGHT_AVAILABLE:
-
-        return {
-
-            "success": False,
-
-            "error":
-            "Playwright is not installed.",
-        }
-
-    if not login_id or not login_password:
-
-        return {
-
-            "success": False,
-
-            "error":
-            "Login ID and password are required.",
-        }
-
-    browser = None
-    context = None
-
-    try:
-
-        with sync_playwright() as p:
-
-            browser = p.chromium.launch(
-                headless=True
-            )
-
-            context = browser.new_context(
-
-                viewport={
-                    "width": 1440,
-                    "height": 1000,
-                },
-
-                user_agent=(
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/138.0 Safari/537.36"
-                ),
-            )
-
-            page = context.new_page()
-
-            page.goto(
-                login_url,
-                wait_until="domcontentloaded",
-                timeout=WEBSITE_TIMEOUT
-            )
-
-            try:
-
-                page.wait_for_load_state(
-                    "networkidle",
-                    timeout=10000
-                )
-
-            except Exception:
-                pass
-
-            username_selectors = [
-
-                "input[type='email']",
-                "input[name*='email' i]",
-                "input[id*='email' i]",
-                "input[name*='username' i]",
-                "input[id*='username' i]",
-                "input[name*='user' i]",
-                "input[id*='user' i]",
-                "input[type='text']",
-            ]
-
-            password_selectors = [
-
-                "input[type='password']",
-                "input[name*='password' i]",
-                "input[id*='password' i]",
-            ]
-
-            username = _visible_locator(
-                page,
-                username_selectors
-            )
-
-            password = _visible_locator(
-                page,
-                password_selectors
-            )
-
-            if not username:
-
-                return {
-
-                    "success": False,
-
-                    "error":
-                    "Could not locate the login ID field.",
-                }
-
-            if not password:
-
-                return {
-
-                    "success": False,
-
-                    "error":
-                    "Could not locate the password field.",
-                }
-
-            username.fill(
-                login_id
-            )
-
-            password.fill(
-                login_password
-            )
-
-            submit_selectors = [
-
-                "button[type='submit']",
-                "input[type='submit']",
-                "button:has-text('Login')",
-                "button:has-text('Log in')",
-                "button:has-text('Sign in')",
-                "button:has-text('Signin')",
-            ]
-
-            submit = _visible_locator(
-                page,
-                submit_selectors
-            )
-
-            if submit:
-
-                submit.click()
-
-            else:
-
-                password.press(
-                    "Enter"
-                )
-
-            try:
-
-                page.wait_for_load_state(
-                    "networkidle",
-                    timeout=15000
-                )
-
-            except Exception:
-                pass
-
-            page.wait_for_timeout(
-                1500
-            )
-
-            challenge = detect_security_challenge(
-                page
-            )
-
-            if challenge:
-
-                return {
-
-                    "success": False,
-
-                    "security_challenge":
-                    challenge,
-
-                    "error":
-                    (
-                        "Website requires "
-                        "security verification."
-                    ),
-                }
-
-            current_url = page.url
-
-            current_lower = (
-                current_url.lower()
-            )
-
-            login_still_visible = (
-
-                page.locator(
-                    "input[type='password']"
-                ).count() > 0
-                and
-                any(
-                    path in current_lower
-                    for path in (
-                        "/login",
-                        "/signin",
-                        "/sign-in",
-                    )
-                )
-            )
-
-            if login_still_visible:
-
-                return {
-
-                    "success": False,
-
-                    "error":
-                    "Login failed or the login page is still active.",
-                }
-
-            storage_state = (
-                context.storage_state()
-            )
-
-            final_url = page.url
-
-            return {
-
-                "success": True,
-
-                "storage_state":
-                storage_state,
-
-                "final_url":
-                final_url,
-            }
-
-    except Exception as e:
-
-        return {
-
-            "success": False,
-
-            "error":
-            repr(e),
-        }
-
-    finally:
-
-        try:
-
-            if context:
-                context.close()
-
-        except Exception:
-            pass
-
-        try:
-
-            if browser:
-                browser.close()
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# WEBSITE HTML PAGE
-# ============================================================
-
-def _website_page_from_html(
-    url,
-    response
-):
-
-    try:
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        for tag in soup(
-            [
-                "script",
-                "style",
-                "noscript",
-                "svg",
-                "iframe",
-                "template",
-            ]
-        ):
-
-            tag.decompose()
-
-        title = ""
-
-        if soup.title:
-
-            title = clean_website_text(
-                soup.title.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-        elements = []
-
-        for element in soup.select(
-            "h1,h2,h3,h4,h5,h6,"
-            "p,li,article,section,"
-            "td,th,button,a"
-        ):
-
-            text = clean_website_text(
-                element.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            if text:
-
-                elements.append({
-
-                    "tag":
-                    element.name,
-
-                    "text":
-                    text[:1500],
-                })
-
-        links = []
-
-        for anchor in soup.select(
-            "a[href]"
-        ):
-
-            href = anchor.get(
-                "href"
-            )
-
-            candidate = normalize_url(
-                href,
-                url
-            )
-
-            if (
-                candidate
-                and
-                same_domain(
-                    candidate,
-                    url
-                )
-                and
-                is_crawlable_url(
-                    candidate
-                )
-            ):
-
-                links.append(
-                    candidate
-                )
-
-        text = clean_website_text(
-            soup.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        return {
-
-            "url":
-            url,
-
-            "title":
-            title,
-
-            "text":
-            text[:50000],
-
-            "elements":
-            elements[:500],
-
-            "links":
-            list(
-                dict.fromkeys(
-                    links
-                )
-            )[:100],
-
-            "requires_login":
-            False,
-        }
-
-    except Exception as e:
-
-        print(
-            "Website HTML parsing error:",
-            repr(e)
-        )
-
-        return None
-
-
-# ============================================================
-# WEBSITE FETCH
-# ============================================================
-
-def fetch_website(url):
-
-    start_url = normalize_url(
-        url
-    )
-
-    if not start_url:
-
-        raise RuntimeError(
-            "Invalid website URL."
-        )
-
-    session = requests.Session()
-
-    session.headers.update({
-
-        "User-Agent":
-        (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/138.0 Safari/537.36"
-        )
-    })
-
-    queue = [
-        start_url
-    ]
-
-    visited = set()
-    pages = []
-
-    while (
-        queue
-        and
-        len(pages) < MAX_WEBSITE_PAGES
-    ):
-
-        current_url = queue.pop(0)
-
-        if current_url in visited:
-            continue
-
-        visited.add(
-            current_url
-        )
-
-        try:
-
-            response = session.get(
-
-                current_url,
-
-                timeout=20,
-
-                allow_redirects=True
-            )
-
-            final_url = normalize_url(
-                response.url
-            )
-
-            if (
-                final_url
-                and
-                same_domain(
-                    final_url,
-                    start_url
-                )
-            ):
-
-                current_url = final_url
-
-            if response.status_code in {
-                401,
-                403,
-            }:
-
-                pages.append({
-
-                    "url":
-                    current_url,
-
-                    "title":
-                    "Login Required",
-
-                    "text":
-                    (
-                        "This page requires login "
-                        "or authorization."
-                    ),
-
-                    "elements":
-                    [],
-
-                    "links":
-                    [],
-
-                    "requires_login":
-                    True,
-                })
-
-                continue
-
-            response.raise_for_status()
-
-            content_type = (
-                response.headers.get(
-                    "content-type",
-                    ""
-                ).lower()
-            )
-
-            if (
-                "text/html"
-                not in content_type
-                and
-                "application/xhtml"
-                not in content_type
-            ):
-
-                continue
-
-            page_data = _website_page_from_html(
-                current_url,
-                response
-            )
-
-            if not page_data:
-                continue
-
-            pages.append(
-                page_data
-            )
-
-            for link in page_data.get(
-                "links",
-                []
-            ):
-
-                if (
-                    link not in visited
-                    and
-                    link not in queue
-                    and
-                    same_domain(
-                        link,
-                        start_url
-                    )
-                ):
-
-                    queue.append(
-                        link
-                    )
-
-        except Exception as e:
-
-            print(
-                "Website fetch error:",
-                current_url,
-                repr(e)
-            )
-
-            continue
-
-    combined_text = "\n\n".join(
-
-        f"PAGE: {page['title']}\n"
-        f"URL: {page['url']}\n"
-        f"{page['text']}"
-
-        for page in pages
-    )
-
-    return {
-
-        "url":
-        start_url,
-
-        "title":
-        (
-            pages[0]["title"]
-            if pages
-            else ""
-        ),
-
-        "text":
-        combined_text[:120000],
-
-        "pages":
-        pages,
-
-        "authenticated":
-        False,
-    }
-
-
-# ============================================================
-# AUTHENTICATED WEBSITE CRAWL
-# ============================================================
-
-def crawl_authenticated_website(
-    start_url,
-    storage_state,
-    max_pages=MAX_WEBSITE_PAGES
-):
-
-    if not PLAYWRIGHT_AVAILABLE:
-
-        raise RuntimeError(
-            "Playwright is required for authenticated websites."
-        )
-
-    start_url = normalize_url(
-        start_url
-    )
-
-    if not start_url:
-
-        raise RuntimeError(
-            "Invalid website URL."
-        )
-
-    queue = [
-        start_url
-    ]
-
-    visited = set()
-    pages = []
-
-    final_storage_state = storage_state
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=True
-        )
-
-        context = browser.new_context(
-
-            storage_state=storage_state,
-
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/138.0 Safari/537.36"
-            ),
-        )
-
-        page = context.new_page()
-
-        while (
-            queue
-            and
-            len(pages) < max_pages
-        ):
-
-            current_url = queue.pop(0)
-
-            if current_url in visited:
-                continue
-
-            visited.add(
-                current_url
-            )
-
-            try:
-
-                page.goto(
-
-                    current_url,
-
-                    wait_until="domcontentloaded",
-
-                    timeout=WEBSITE_TIMEOUT
-                )
-
+            if not clicked:
                 try:
-
-                    page.wait_for_load_state(
-                        "networkidle",
-                        timeout=8000
-                    )
-
+                    password_field.evaluate("""
+                        el => { const f=el.closest('form');
+                        if(f){ if(f.requestSubmit) f.requestSubmit(); else f.submit(); } }
+                    """)
+                    clicked = True
                 except Exception:
                     pass
 
-                page.wait_for_timeout(
-                    700
-                )
+            if not clicked:
+                browser.close()
+                return {"success": False, "manual_required": False,
+                        "message": "Could not submit the login form."}
 
-                current_url = normalize_url(
-                    page.url
-                ) or current_url
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2500)
 
-                if not same_domain(
-                    current_url,
-                    start_url
-                ):
+            challenge = detect_security_challenge(page)
+            if challenge:
+                browser.close()
+                return {"success": False, "manual_required": True,
+                        "message": "The website requested CAPTCHA/OTP/2FA/additional verification."}
 
-                    continue
+            current = page.url.lower()
+            try:
+                body = page.locator("body").inner_text(timeout=5000).lower()
+            except Exception:
+                body = ""
+            password_still_visible = False
+            try:
+                pw = page.locator("input[type='password']")
+                for i in range(min(pw.count(), 10)):
+                    if pw.nth(i).is_visible():
+                        password_still_visible = True
+                        break
+            except Exception:
+                pass
+            failure_words = [
+                "invalid password", "incorrect password", "invalid username",
+                "invalid credentials", "wrong password", "login failed",
+                "authentication failed", "incorrect login",
+            ]
+            failed_text = any(x in body for x in failure_words)
+            still_login = any(x in current for x in ("/login", "/signin", "/sign-in", "/authenticate"))
+            if failed_text or (password_still_visible and still_login):
+                browser.close()
+                return {"success": False, "manual_required": False,
+                        "message": "Login failed. Please check Login ID and Password."}
 
-                title = clean_website_text(
-                    page.title()
-                )
+            state = context.storage_state()
+            final_url = page.url
+            browser.close()
+            return {"success": True, "manual_required": False,
+                    "storage_state": state, "final_url": final_url}
+    except Exception as e:
+        return {"success": False, "manual_required": False,
+                "message": f"Login process failed: {e}"}
 
-                try:
 
-                    body_text = clean_website_text(
-                        page.locator(
-                            "body"
-                        ).inner_text(
-                            timeout=3000
-                        )
-                    )
-
-                except Exception:
-
-                    body_text = ""
-
-                elements = []
-
-                locator = page.locator(
-
-                    "h1,h2,h3,h4,h5,h6,"
-                    "p,li,article,section,"
-                    "td,th,button,a"
-                )
-
-                count = min(
-                    locator.count(),
-                    1500
-                )
-
-                for i in range(count):
-
-                    try:
-
-                        element = locator.nth(
-                            i
-                        )
-
-                        if not element.is_visible():
-                            continue
-
-                        text = clean_website_text(
-
-                            element.inner_text(
-                                timeout=500
-                            )
-                        )
-
-                        if not text:
-                            continue
-
-                        tag = element.evaluate(
-                            "el => el.tagName.toLowerCase()"
-                        )
-
-                        elements.append({
-
-                            "tag":
-                            tag,
-
-                            "text":
-                            text[:1500],
-                        })
-
-                    except Exception:
-                        continue
-
-                links = []
-
-                anchors = page.locator(
-                    "a[href]"
-                )
-
-                for i in range(
-                    min(
-                        anchors.count(),
-                        1000
-                    )
-                ):
-
-                    try:
-
-                        href = anchors.nth(
-                            i
-                        ).get_attribute(
-                            "href"
-                        )
-
-                        candidate = normalize_url(
-                            href,
-                            current_url
-                        )
-
-                        if (
-                            candidate
-                            and
-                            same_domain(
-                                candidate,
-                                start_url
-                            )
-                            and
-                            is_crawlable_url(
-                                candidate
-                            )
-                        ):
-
-                            links.append(
-                                candidate
-                            )
-
-                    except Exception:
-                        continue
-
-                links = list(
-                    dict.fromkeys(
-                        links
-                    )
-                )
-
-                pages.append({
-
-                    "url":
-                    current_url,
-
-                    "title":
-                    title,
-
-                    "text":
-                    body_text[:50000],
-
-                    "elements":
-                    elements[:500],
-
-                    "links":
-                    links[:100],
-
-                    "requires_login":
-                    False,
-                })
-
-                for link in links:
-
-                    if (
-                        link not in visited
-                        and
-                        link not in queue
-                    ):
-
-                        queue.append(
-                            link
-                        )
-
-            except Exception as e:
-
-                print(
-                    "Authenticated crawl error:",
-                    repr(e)
-                )
-
-                continue
-
-        try:
-
-            final_storage_state = (
-                context.storage_state()
-            )
-
-        except Exception:
-            pass
-
-        context.close()
-        browser.close()
-
-    combined_text = "\n\n".join(
-
-        f"PAGE: {page['title']}\n"
-        f"URL: {page['url']}\n"
-        f"{page['text']}"
-
-        for page in pages
-    )
-
+def _website_page_from_html(url, response):
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "svg", "iframe", "template"]):
+        tag.decompose()
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    elements=[]
+    for tag in soup.find_all(["h1","h2","h3","h4","h5","h6","p","li","article","section","td","th","button","a"]):
+        text=clean_website_text(tag.get_text(" ", strip=True))
+        if text:
+            elements.append({"tag":tag.name,"text":text[:1500]})
+    links=[]
+    for a in soup.find_all("a", href=True):
+        candidate=normalize_url(a.get("href"), response.url)
+        if candidate and same_domain(candidate,url) and is_crawlable_url(candidate):
+            links.append(candidate)
     return {
-
-        "url":
-        start_url,
-
-        "title":
-        (
-            pages[0]["title"]
-            if pages
-            else ""
-        ),
-
-        "text":
-        combined_text[:120000],
-
-        "pages":
-        pages,
-
-        "authenticated":
-        True,
-
-        "storage_state":
-        final_storage_state,
+        "url": normalize_url(response.url),
+        "title": clean_website_text(title),
+        "text": clean_website_text(soup.get_text(" ", strip=True))[:50000],
+        "elements": elements[:500],
+        "links": list(dict.fromkeys(links))[:100],
+        "requires_login": False,
     }
 
 
-# ============================================================
-# FIND RELEVANT WEBSITE PAGE
-# ============================================================
+def fetch_website(url):
+    url=normalize_url(url)
+    if not url:
+        raise RuntimeError("Website URL is empty.")
+    headers={"User-Agent":("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/138.0 Safari/537.36")}
+    session=requests.Session(); session.headers.update(headers)
+    queue=[url]; visited=set(); pages=[]
+    while queue and len(pages)<25:
+        current=queue.pop(0)
+        if current in visited: continue
+        visited.add(current)
+        try:
+            response=session.get(current,timeout=20,allow_redirects=True)
+            final=normalize_url(response.url)
+            ct=response.headers.get("content-type","").lower()
+            if response.status_code in (401,403):
+                pages.append({"url":final,"title":"","text":"","elements":[],"links":[],"requires_login":True})
+                continue
+            if "text/html" not in ct and not response.text.lstrip().startswith("<"):
+                continue
+            page=_website_page_from_html(url,response)
+            pages.append(page)
+            for link in page["links"]:
+                if link not in visited:
+                    queue.append(link)
+        except Exception:
+            continue
+    text="\n\n".join(f"PAGE: {x['title']}\nURL: {x['url']}\n{x['text']}" for x in pages)
+    return {"url":url,"title":pages[0]["title"] if pages else "","text":text[:120000],"pages":pages,"authenticated":False}
 
-def find_relevant_website_page(
-    question,
-    website_data
-):
 
-    pages = (
-
-        website_data.get(
-            "pages",
-            []
+def crawl_authenticated_website(start_url, storage_state, max_pages=25):
+    start_url=normalize_url(start_url)
+    queue=[start_url]; visited=set(); pages=[]
+    with sync_playwright() as p:
+        browser=p.chromium.launch(headless=True)
+        context=p.chromium.new_context(
+            storage_state=storage_state,
+            viewport={"width":1440,"height":1000},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0 Safari/537.36")
         )
+        page=context.new_page()
+        while queue and len(pages)<max_pages:
+            current=queue.pop(0)
+            if current in visited: continue
+            visited.add(current)
+            try:
+                page.goto(current,wait_until="domcontentloaded",timeout=30000)
+                try: page.wait_for_load_state("networkidle",timeout=10000)
+                except Exception: pass
+                page.wait_for_timeout(600)
+                final=normalize_url(page.url)
+                if not same_domain(final,start_url): continue
+                try: title=page.title()
+                except Exception: title=""
+                try: body=clean_website_text(page.locator("body").inner_text(timeout=5000))
+                except Exception: body=""
+                requires=any(x in final.lower() for x in ("/login","/signin","/sign-in","/authenticate"))
+                try:
+                    elements=page.locator("h1,h2,h3,h4,h5,h6,p,li,article,section,td,th,button,a").evaluate_all(
+                        "els=>els.map(el=>({tag:el.tagName.toLowerCase(),text:(el.innerText||'').trim()})).filter(x=>x.text).slice(0,500)"
+                    )
+                except Exception: elements=[]
+                links=[]
+                try:
+                    raw=page.locator("a[href]").evaluate_all("els=>els.map(a=>a.href)")
+                    for link in raw:
+                        c=normalize_url(link,final)
+                        if c and same_domain(c,start_url) and is_crawlable_url(c): links.append(c)
+                except Exception: pass
+                links=list(dict.fromkeys(links))[:100]
+                pages.append({"url":final,"title":title,"text":body[:50000],"elements":elements,
+                              "links":links,"requires_login":requires})
+                for link in links:
+                    if link not in visited: queue.append(link)
+            except Exception: continue
+        browser.close()
+    text="\n\n".join(f"PAGE: {x['title']}\nURL: {x['url']}\n{x['text']}" for x in pages)
+    return {"url":start_url,"title":pages[0]["title"] if pages else "","text":text[:120000],
+            "pages":pages,"authenticated":True,"storage_state":storage_state}
 
-        if website_data
 
-        else []
-    )
+def find_relevant_website_section(question, sections):
+    if not sections: return None
+    scored=[]
+    for section in sections:
+        scored.append((calculate_relevance(question,section.get("text",section.get("section_text",""))),section))
+    scored.sort(key=lambda x:x[0],reverse=True)
+    return scored[0][1] if scored else None
 
-    if not pages:
-        return None
 
-    scored = []
-
-    question_tokens = relevance_tokens(
-        question
-    )
-
-    question_normalized = " ".join(
-        normalize_words(
-            question
-        )
-    )
-
+def find_relevant_website_page(question, website_data):
+    pages=website_data.get("pages",[]) if website_data else []
+    if not pages: return None
+    scored=[]
     for page in pages:
-
-        title = page.get(
-            "title",
-            ""
-        )
-
-        url = page.get(
-            "url",
-            ""
-        )
-
-        text = page.get(
-            "text",
-            ""
-        )
-
-        elements_text = " ".join(
-
-            item.get(
-                "text",
-                ""
-            )
-
-            for item in page.get(
-                "elements",
-                []
-            )
-        )
-
-        content = (
-            f"{title} "
-            f"{url} "
-            f"{text} "
-            f"{elements_text}"
-        )
-
-        score = calculate_relevance(
-            question,
-            content
-        )
-
-        title_score = calculate_relevance(
-            question,
-            title
-        )
-
-        score += (
-            title_score * 4
-        )
-
-        url_lower = url.lower()
-
-        for token in question_tokens:
-
-            if len(token) >= 4:
-
-                if token in url_lower:
-                    score += 5
-
-        normalized_content = " ".join(
-            normalize_words(
-                content
-            )
-        )
-
-        if (
-            len(question_normalized) > 8
-            and
-            question_normalized
-            in normalized_content
-        ):
-
-            score += 20
-
-        scored.append(
-            (
-                score,
-                page
-            )
-        )
-
-    scored.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
+        content=" ".join([page.get("title",""),page.get("url",""),page.get("text","")])
+        score=calculate_relevance(question,content)
+        for token in relevance_tokens(question):
+            if len(token)>=4 and token in (page.get("title","")+" "+page.get("url","")).lower(): score+=5
+        scored.append((score,page))
+    scored.sort(key=lambda x:x[0],reverse=True)
     return scored[0][1]
 
 
-# ============================================================
-# EXACT WEBSITE SCREENSHOT
-# ============================================================
-
-def capture_website_sections(
-    url,
-    storage_state=None,
-    question=None
-):
-
-    if not PLAYWRIGHT_AVAILABLE:
-        return []
-
-    if not question:
-        return []
-
-    results = []
-
+def capture_website_sections(url, storage_state=None, question=None):
+    if not PLAYWRIGHT_AVAILABLE: return []
+    result=[]
     try:
-
         with sync_playwright() as p:
-
-            browser = p.chromium.launch(
-                headless=True
-            )
-
-            browser_args = {
-
-                "viewport": {
-                    "width": 1440,
-                    "height": 1000,
-                },
-
-                "device_scale_factor": 1,
-
-                "user_agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/138.0 Safari/537.36"
-                ),
-            }
-
-            if storage_state:
-                browser_args[
-                    "storage_state"
-                ] = storage_state
-
-            context = browser.new_context(
-                **browser_args
-            )
-
-            page = context.new_page()
-
-            page.goto(
-
-                url,
-
-                wait_until="domcontentloaded",
-
-                timeout=WEBSITE_TIMEOUT
-            )
-
-            try:
-
-                page.wait_for_load_state(
-                    "networkidle",
-                    timeout=10000
-                )
-
-            except Exception:
-                pass
-
-            page.wait_for_timeout(
-                1200
-            )
-
-            current = page.url.lower()
-
-            if any(
-
-                x in current
-
-                for x in (
-                    "/login",
-                    "/signin",
-                    "/sign-in",
-                    "/authenticate",
-                )
-            ):
-
-                context.close()
-                browser.close()
-
-                return []
-
-            # ------------------------------------------------
-            # Trigger lazy content
-            # ------------------------------------------------
-
-            for _ in range(10):
-
+            browser=p.chromium.launch(headless=True)
+            args={"viewport":{"width":1440,"height":1000},"device_scale_factor":1,
+                  "user_agent":("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0 Safari/537.36")}
+            if storage_state: args["storage_state"]=storage_state
+            context=browser.new_context(**args)
+            page=context.new_page()
+            page.goto(url,wait_until="domcontentloaded",timeout=30000)
+            try: page.wait_for_load_state("networkidle",timeout=10000)
+            except Exception: pass
+            page.wait_for_timeout(1000)
+            current=page.url.lower()
+            if any(x in current for x in ("/login","/signin","/sign-in","/authenticate")):
+                context.close(); browser.close(); return []
+            for _ in range(8):
                 try:
-
-                    page.mouse.wheel(
-                        0,
-                        1200
-                    )
-
-                    page.wait_for_timeout(
-                        250
-                    )
-
-                except Exception:
-
-                    break
-
-            page.evaluate(
-                "window.scrollTo(0, 0)"
-            )
-
-            page.wait_for_timeout(
-                500
-            )
-
-            selector = (
-
-                "h1,h2,h3,h4,h5,h6,"
-                "p,li,td,th,"
-                "article,section,"
-                "button,a,label,"
-                "[role='heading'],"
-                "[role='button']"
-            )
-
-            locator = page.locator(
-                selector
-            )
-
-            count = min(
-                locator.count(),
-                3000
-            )
-
-            candidates = []
-
-            q_normalized = " ".join(
-                normalize_words(
-                    question
-                )
-            )
-
-            for i in range(count):
-
+                    page.mouse.wheel(0,1200); page.wait_for_timeout(250)
+                except Exception: break
+            page.evaluate("window.scrollTo(0,0)"); page.wait_for_timeout(400)
+            loc=page.locator("h1,h2,h3,h4,h5,h6,article,section,p,li,td,th,a,button,div")
+            q=question or ""
+            best=[]
+            for i in range(min(loc.count(),2500)):
                 try:
-
-                    element = locator.nth(
-                        i
-                    )
-
-                    if not element.is_visible():
-                        continue
-
-                    text = clean_website_text(
-
-                        element.inner_text(
-                            timeout=1000
-                        )
-                    )
-
-                    if not text:
-                        continue
-
-                    if len(text) > 6000:
-                        continue
-
-                    box = element.bounding_box()
-
-                    if not box:
-                        continue
-
-                    if box["width"] < 20:
-                        continue
-
-                    if box["height"] < 10:
-                        continue
-
-                    score = calculate_relevance(
-                        question,
-                        text
-                    )
-
-                    if score <= 0:
-                        continue
-
-                    tag = element.evaluate(
-                        "el => el.tagName.toLowerCase()"
-                    )
-
-                    if tag.startswith("h"):
-                        score += 8
-
-                    t_normalized = " ".join(
-                        normalize_words(
-                            text
-                        )
-                    )
-
-                    if (
-                        q_normalized
-                        and
-                        len(q_normalized) > 6
-                        and
-                        q_normalized
-                        in t_normalized
-                    ):
-
-                        score += 15
-
-                    area = (
-                        box["width"]
-                        *
-                        box["height"]
-                    )
-
-                    if area > (
-                        1440 * 1000 * 0.8
-                    ):
-
-                        score -= 20
-
-                    elif area > (
-                        1440 * 1000 * 0.5
-                    ):
-
-                        score -= 10
-
-                    try:
-
-                        metadata = element.evaluate(
-
-                            """
-                            el => ({
-                                id: el.id || "",
-                                className:
-                                    typeof el.className === "string"
-                                    ? el.className
-                                    : "",
-                                aria:
-                                    el.getAttribute("aria-label") || "",
-                                title:
-                                    el.getAttribute("title") || "",
-                                href:
-                                    el.getAttribute("href") || ""
-                            })
-                            """
-                        )
-
-                    except Exception:
-
-                        metadata = {}
-
-                    attribute_text = " ".join([
-
-                        metadata.get(
-                            "id",
-                            ""
-                        ),
-
-                        metadata.get(
-                            "className",
-                            ""
-                        ),
-
-                        metadata.get(
-                            "aria",
-                            ""
-                        ),
-
-                        metadata.get(
-                            "title",
-                            ""
-                        ),
-
-                        metadata.get(
-                            "href",
-                            ""
-                        ),
-                    ])
-
-                    score += calculate_relevance(
-                        question,
-                        attribute_text
-                    )
-
-                    candidates.append({
-
-                        "score":
-                        score,
-
-                        "element":
-                        element,
-
-                        "text":
-                        text,
-
-                        "tag":
-                        tag,
-
-                        "box":
-                        box,
-                    })
-
-                except Exception:
-                    continue
-
-            candidates.sort(
-                key=lambda x: x["score"],
-                reverse=True
-            )
-
-            # ------------------------------------------------
-            # Remove nested duplicates
-            # ------------------------------------------------
-
-            selected = []
-
-            for candidate in candidates:
-
-                box = candidate[
-                    "box"
-                ]
-
-                duplicate = False
-
-                for old in selected:
-
-                    old_box = old[
-                        "box"
-                    ]
-
-                    if (
-
-                        box["x"] >= old_box["x"]
-
-                        and
-
-                        box["y"] >= old_box["y"]
-
-                        and
-
-                        box["x"]
-                        +
-                        box["width"]
-                        <=
-                        old_box["x"]
-                        +
-                        old_box["width"]
-
-                        and
-
-                        box["y"]
-                        +
-                        box["height"]
-                        <=
-                        old_box["y"]
-                        +
-                        old_box["height"]
-                    ):
-
-                        duplicate = True
-
-                        break
-
-                if not duplicate:
-
-                    selected.append(
-                        candidate
-                    )
-
-                if len(selected) >= 3:
-                    break
-
-            # ------------------------------------------------
-            # Capture actual screenshots
-            # ------------------------------------------------
-
-            for candidate in selected:
-
+                    el=loc.nth(i)
+                    if not el.is_visible(): continue
+                    text=clean_website_text(el.inner_text(timeout=800))
+                    if not text or len(text)>12000: continue
+                    box=el.bounding_box()
+                    if not box or box["width"]<30 or box["height"]<15: continue
+                    score=calculate_relevance(q,text) if q else 0
+                    tag=el.evaluate("el=>el.tagName.toLowerCase()")
+                    if tag.startswith("h"): score+=5
+                    if tag in ("article","section"): score+=3
+                    area=box["width"]*box["height"]
+                    if area>1440*1000*.8: score-=15
+                    elif area>1440*1000*.5: score-=8
+                    best.append((score,el,text,tag))
+                except Exception: continue
+            best.sort(key=lambda x:x[0],reverse=True)
+            for score,el,text,tag in best[:12]:
                 try:
-
-                    element = candidate[
-                        "element"
-                    ]
-
-                    element.scroll_into_view_if_needed(
-                        timeout=5000
-                    )
-
-                    page.wait_for_timeout(
-                        300
-                    )
-
-                    box = element.bounding_box()
-
-                    if not box:
-                        continue
-
-                    padding = 25
-
-                    viewport_width = 1440
-                    viewport_height = 1000
-
-                    x = max(
-                        0,
-                        box["x"] - padding
-                    )
-
-                    y = max(
-                        0,
-                        box["y"] - padding
-                    )
-
-                    width = min(
-
-                        viewport_width - x,
-
-                        box["width"]
-                        +
-                        padding * 2
-                    )
-
-                    height = min(
-
-                        viewport_height - y,
-
-                        box["height"]
-                        +
-                        padding * 2
-                    )
-
-                    clip = {
-
-                        "x":
-                        x,
-
-                        "y":
-                        y,
-
-                        "width":
-                        max(
-                            20,
-                            width
-                        ),
-
-                        "height":
-                        max(
-                            20,
-                            height
-                        ),
-                    }
-
-                    # Temporary outline
-                    try:
-
-                        element.evaluate(
-
-                            """
-                            el => {
-                                el.dataset.aiOriginalOutline =
-                                    el.style.outline;
-
-                                el.style.outline =
-                                    '3px solid red';
-
-                                el.style.outlineOffset =
-                                    '2px';
-                            }
-                            """
-                        )
-
-                    except Exception:
-                        pass
-
-                    image = page.screenshot(
-
-                        type="png",
-
-                        clip=clip,
-
-                        animations="disabled",
-                    )
-
-                    try:
-
-                        element.evaluate(
-
-                            """
-                            el => {
-                                el.style.outline =
-                                    el.dataset.aiOriginalOutline || '';
-
-                                delete el.dataset.aiOriginalOutline;
-                            }
-                            """
-                        )
-
-                    except Exception:
-                        pass
-
-                    results.append({
-
-                        "text":
-                        candidate[
-                            "text"
-                        ],
-
-                        "image":
-                        image,
-
-                        "mime_type":
-                        "image/png",
-
-                        "url":
-                        page.url,
-
-                        "tag":
-                        candidate[
-                            "tag"
-                        ],
-
-                        "score":
-                        candidate[
-                            "score"
-                        ],
-
-                        "exact_position":
-                        candidate[
-                            "box"
-                        ],
-                    })
-
-                except Exception as e:
-
-                    print(
-                        "Website target capture error:",
-                        repr(e)
-                    )
-
-            context.close()
-            browser.close()
-
+                    target=el
+                    if tag in ("h1","h2","h3","h4","h5","h6","p","a","button"):
+                        parent=el.locator("xpath=ancestor::*[self::article or self::section or self::li][1]")
+                        if parent.count()>0 and parent.first.is_visible():
+                            pt=clean_website_text(parent.first.inner_text(timeout=1000))
+                            if pt and len(pt)<=12000 and calculate_relevance(q,pt)>=score-5:
+                                target=parent.first; text=pt
+                    target.scroll_into_view_if_needed(timeout=5000); page.wait_for_timeout(300)
+                    image=target.screenshot(type="png",animations="disabled",timeout=10000)
+                    result.append({"text":text,"image":image,"mime_type":"image/png","url":page.url})
+                    if len(result)>=5: break
+                except Exception: continue
+            context.close(); browser.close()
     except Exception as e:
-
-        print(
-            "Website screenshot error:",
-            repr(e)
-        )
-
-    return results
+        print("Website screenshot error:",repr(e))
+    return result
 
 
-# ============================================================
-# EXACT WEBSITE SECTION
-# ============================================================
-
-def capture_exact_website_section(
-    page_url,
-    question,
-    storage_state=None
-):
-
-    sections = capture_website_sections(
-
-        page_url,
-
-        storage_state=storage_state,
-
-        question=question
-    )
-
+def capture_exact_website_section(page_url, question, storage_state=None):
+    sections=capture_website_sections(page_url,storage_state=storage_state,question=question)
     if not sections:
-
-        inspection = inspect_website_access(
-            page_url
-        )
-
-        if inspection.get(
-            "requires_login"
-        ):
-
-            return {
-
-                "success":
-                False,
-
-                "requires_login":
-                True,
-
-                "login_url":
-                inspection.get(
-                    "login_url",
-                    page_url
-                ),
-            }
-
-        return {
-
-            "success":
-            False,
-
-            "requires_login":
-            False,
-
-            "error":
-            (
-                "Could not locate the exact "
-                "website position."
-            ),
-        }
-
-    section = sections[0]
-
-    return {
-
-        "success":
-        True,
-
-        "requires_login":
-        False,
-
-        "image":
-        section["image"],
-
-        "url":
-        section.get(
-            "url",
-            page_url
-        ),
-
-        "section_text":
-        section.get(
-            "text",
-            ""
-        ),
-
-        "tag":
-        section.get(
-            "tag",
-            ""
-        ),
-
-        "score":
-        section.get(
-            "score",
-            0
-        ),
-
-        "exact_position":
-        section.get(
-            "exact_position"
-        ),
-    }
+        inspection=inspect_website_access(page_url)
+        if inspection.get("requires_login"):
+            return {"success":False,"requires_login":True,"login_url":inspection.get("login_url",page_url)}
+        return {"success":False,"requires_login":False,"error":"Could not capture relevant website section."}
+    section=find_relevant_website_section(question,sections)
+    if not section:
+        return {"success":False,"requires_login":False,"error":"No relevant section found."}
+    return {"success":True,"requires_login":False,"image":section["image"],"url":section.get("url",page_url),
+            "section_text":section.get("text","")}
 
 
-# ============================================================
-# WEBSITE QUESTION SOURCE
-# ============================================================
+def get_website_question_source(question, source):
+    website_data=source.get("website_data") if source else None
+    page=find_relevant_website_page(question,website_data)
+    if not page: return [], ""
+    state=source.get("storage_state") or website_data.get("storage_state")
+    shot=capture_exact_website_section(page.get("url"),question,state)
+    if shot.get("requires_login"):
+        return [{"type":"website_login_required","login_url":shot.get("login_url",page.get("url"))}], ""
+    if not shot.get("success"):
+        return [], f"Relevant website page:\n{page.get('url')}\n\nPage title:\n{page.get('title')}\n\nContent:\n{page.get('text','')[:15000]}"
+    return [{"type":"image","data":shot["image"],"caption":"🌐 Exact relevant website section",
+             "mime_type":"image/png","url":shot["url"],"section_text":shot["section_text"]}], \
+           f"Relevant website page: {shot['url']}\n\nExact selected section:\n{shot['section_text']}"
 
-def get_website_question_source(
-    question,
-    source
-):
-
-    website_data = (
-
-        source.get(
-            "website_data"
-        )
-
-        if source
-
-        else None
-    )
-
-    page = find_relevant_website_page(
-        question,
-        website_data
-    )
-
-    if not page:
-        return [], ""
-
-    state = (
-
-        source.get(
-            "storage_state"
-        )
-
-        or
-        website_data.get(
-            "storage_state"
-        )
-    )
-
-    shot = capture_exact_website_section(
-
-        page.get(
-            "url"
-        ),
-
-        question,
-
-        state
-    )
-
-    if shot.get(
-        "requires_login"
-    ):
-
-        return [
-
-            {
-
-                "type":
-                "website_login_required",
-
-                "login_url":
-                shot.get(
-                    "login_url",
-                    page.get(
-                        "url"
-                    )
-                ),
-            }
-
-        ], ""
-
-    if not shot.get(
-        "success"
-    ):
-
-        return [], (
-
-            f"Relevant website page:\n"
-            f"{page.get('url')}\n\n"
-
-            f"Page title:\n"
-            f"{page.get('title')}\n\n"
-
-            f"Content:\n"
-            f"{page.get('text', '')[:15000]}"
-        )
-
-    media = {
-
-        "type":
-        "image",
-
-        "data":
-        shot["image"],
-
-        "caption":
-        "🌐 Exact website position",
-
-        "mime_type":
-        "image/png",
-
-        "url":
-        shot["url"],
-
-        "section_text":
-        shot["section_text"],
-
-        "tag":
-        shot.get(
-            "tag",
-            ""
-        ),
-
-        "exact_position":
-        shot.get(
-            "exact_position"
-        ),
-
-        "score":
-        shot.get(
-            "score",
-            0
-        ),
-    }
-
-    context = (
-
-        f"Relevant website page:\n"
-        f"{shot['url']}\n\n"
-
-        f"Exact selected website element:\n"
-        f"{shot['section_text']}\n\n"
-
-        f"DOM element type:\n"
-        f"{shot.get('tag', '')}"
-    )
-
-    return [
-        media
-    ], context
 
 
 # ============================================================
@@ -4126,6 +2718,12 @@ def get_website_question_source(
 def process_uploaded_file(
     uploaded_file
 ):
+
+    if uploaded_file is None:
+
+        return {
+            "source_type": None
+        }
 
     filename = uploaded_file.name
 
@@ -4168,9 +2766,6 @@ def process_uploaded_file(
         "pdf_pages":
         [],
 
-        "render_pdf_bytes":
-        None,
-
         "video_path":
         None,
 
@@ -4181,40 +2776,49 @@ def process_uploaded_file(
         "en",
     }
 
-    # --------------------------------------------------------
+    # ========================================================
     # PDF
-    # --------------------------------------------------------
+    # ========================================================
 
     if extension == ".pdf":
 
         result["source_type"] = "pdf"
 
-        pdf_pages = extract_pdf_data(
-            file_bytes
+        pdf_pages = (
+            extract_pdf_data(
+                file_bytes
+            )
         )
 
-        result["pdf_pages"] = pdf_pages
+        result["pdf_pages"] = (
+            pdf_pages
+        )
 
         result["uploaded_context"] = (
             "\n\n".join(
+
                 page["text"]
+
                 for page in pdf_pages
+
                 if page["text"]
             )
         )
 
         result["file_part"] = (
             types.Part.from_bytes(
+
                 data=file_bytes,
+
                 mime_type="application/pdf"
             )
         )
 
         return result
 
-    # --------------------------------------------------------
+    # ========================================================
     # DOCX
-    # --------------------------------------------------------
+    # ========================================================
 
     if extension == ".docx":
 
@@ -4232,16 +2836,17 @@ def process_uploaded_file(
                 data=file_bytes,
 
                 mime_type=(
-                    "application/"
-                    "vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document"
+                    "application/vnd.openxmlformats-"
+                    "officedocument.wordprocessingml.document"
                 )
             )
         )
 
         converted_pdf = (
             convert_office_to_pdf(
+
                 file_bytes,
+
                 ".docx"
             )
         )
@@ -4260,9 +2865,9 @@ def process_uploaded_file(
 
         return result
 
-    # --------------------------------------------------------
+    # ========================================================
     # PPTX
-    # --------------------------------------------------------
+    # ========================================================
 
     if extension == ".pptx":
 
@@ -4288,8 +2893,10 @@ def process_uploaded_file(
 
             try:
 
-                presentation = Presentation(
-                    pptx_path
+                presentation = (
+                    Presentation(
+                        pptx_path
+                    )
                 )
 
                 slide_texts = []
@@ -4302,18 +2909,16 @@ def process_uploaded_file(
 
                     for shape in slide.shapes:
 
-                        if (
-                            hasattr(
-                                shape,
-                                "text"
-                            )
-                            and
-                            shape.text.strip()
+                        if hasattr(
+                            shape,
+                            "text"
                         ):
 
-                            parts.append(
-                                shape.text.strip()
-                            )
+                            if shape.text.strip():
+
+                                parts.append(
+                                    shape.text.strip()
+                                )
 
                     slide_texts.append({
 
@@ -4321,9 +2926,7 @@ def process_uploaded_file(
                         index + 1,
 
                         "text":
-                        "\n".join(
-                            parts
-                        ),
+                        "\n".join(parts),
                     })
 
                 result["pdf_pages"] = (
@@ -4332,7 +2935,9 @@ def process_uploaded_file(
 
                 result["uploaded_context"] = (
                     "\n\n".join(
+
                         page["text"]
+
                         for page in slide_texts
                     )
                 )
@@ -4340,9 +2945,11 @@ def process_uploaded_file(
             finally:
 
                 try:
+
                     os.remove(
                         pptx_path
                     )
+
                 except Exception:
                     pass
 
@@ -4359,8 +2966,7 @@ def process_uploaded_file(
                 data=file_bytes,
 
                 mime_type=(
-                    "application/"
-                    "vnd.openxmlformats-officedocument."
+                    "application/vnd.openxmlformats-officedocument."
                     "presentationml.presentation"
                 )
             )
@@ -4368,7 +2974,9 @@ def process_uploaded_file(
 
         converted_pdf = (
             convert_office_to_pdf(
+
                 file_bytes,
+
                 ".pptx"
             )
         )
@@ -4379,22 +2987,33 @@ def process_uploaded_file(
                 converted_pdf
             )
 
-            result["pdf_pages"] = (
+            # Use converted PDF pages for
+            # actual visual page/slide matching.
+
+            converted_pages = (
                 extract_pages_from_pdf_bytes(
                     converted_pdf
                 )
             )
 
+            if converted_pages:
+
+                result["pdf_pages"] = (
+                    converted_pages
+                )
+
         return result
 
-    # --------------------------------------------------------
-    # TEXT
-    # --------------------------------------------------------
+    # ========================================================
+    # TEXT FILES
+    # ========================================================
 
     if extension in {
+
         ".txt",
         ".md",
-        ".csv",
+        ".csv"
+
     }:
 
         result["source_type"] = "text"
@@ -4408,17 +3027,26 @@ def process_uploaded_file(
 
         return result
 
-    # --------------------------------------------------------
-    # IMAGE
-    # --------------------------------------------------------
+    # ========================================================
+    # IMAGES
+    # ========================================================
 
     image_extensions = {
 
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
+        ".jpg":
+        "image/jpeg",
+
+        ".jpeg":
+        "image/jpeg",
+
+        ".png":
+        "image/png",
+
+        ".webp":
+        "image/webp",
+
+        ".gif":
+        "image/gif",
     }
 
     if extension in image_extensions:
@@ -4430,17 +3058,19 @@ def process_uploaded_file(
 
                 data=file_bytes,
 
-                mime_type=image_extensions[
-                    extension
-                ]
+                mime_type=(
+                    image_extensions[
+                        extension
+                    ]
+                )
             )
         )
 
         return result
 
-    # --------------------------------------------------------
+    # ========================================================
     # VIDEO
-    # --------------------------------------------------------
+    # ========================================================
 
     if extension in {
 
@@ -4449,6 +3079,7 @@ def process_uploaded_file(
         ".m4v",
         ".avi",
         ".mkv",
+
     }:
 
         result["source_type"] = "video"
@@ -4456,7 +3087,6 @@ def process_uploaded_file(
         if not check_ffmpeg():
 
             raise RuntimeError(
-
                 "FFmpeg is required for video upload. "
                 "Please install FFmpeg and add it to PATH."
             )
@@ -4464,6 +3094,7 @@ def process_uploaded_file(
         video_path = save_video_to_temp(
 
             file_bytes,
+
             extension
         )
 
@@ -4481,7 +3112,9 @@ def process_uploaded_file(
                 )
             )
 
-            whisper_model = load_whisper()
+            whisper_model = (
+                load_whisper()
+            )
 
             (
                 language,
@@ -4493,7 +3126,7 @@ def process_uploaded_file(
 
                 wav_path,
 
-                return_segments=True
+                return_segments=True,
             )
 
             result["video_language"] = (
@@ -4516,16 +3149,22 @@ def process_uploaded_file(
 
         finally:
 
-            if (
-                wav_path
-                and
-                os.path.exists(wav_path)
-            ):
+            try:
 
-                try:
-                    os.remove(wav_path)
-                except Exception:
-                    pass
+                if (
+                    wav_path
+                    and
+                    os.path.exists(
+                        wav_path
+                    )
+                ):
+
+                    os.remove(
+                        wav_path
+                    )
+
+            except Exception:
+                pass
 
         return result
 
@@ -4533,351 +3172,168 @@ def process_uploaded_file(
 
 
 # ============================================================
-# QUESTION SOURCE MEDIA
+# FIND RELEVANT VIDEO SEGMENTS
 # ============================================================
 
-def get_question_source_media(
-    question
+def find_relevant_video_segments(
+    question,
+    segments,
+    max_segments=2
 ):
 
-    source = (
-        st.session_state.source_data
-    )
+    if not segments:
 
-    if not source:
-        return [], ""
+        return []
 
-    source_type = source.get(
-        "source_type"
-    )
+    scored = []
 
-    media = []
-    extra_context = ""
+    for segment in segments:
 
-    # --------------------------------------------------------
-    # PDF
-    # --------------------------------------------------------
-
-    if source_type == "pdf":
-
-        pages = find_relevant_pdf_pages(
+        score = calculate_relevance(
 
             question,
 
-            source.get(
-                "pdf_pages",
-                []
-            ),
-
-            max_pages=2
-        )
-
-        for page in pages:
-
-            image_bytes = (
-                render_pdf_relevant_crop(
-
-                    source["file_bytes"],
-
-                    page["page_number"],
-
-                    question
-                )
-            )
-
-            if image_bytes:
-
-                media.append({
-
-                    "type":
-                    "image",
-
-                    "data":
-                    image_bytes,
-
-                    "caption":
-                    (
-                        "📄 Exact relevant "
-                        "PDF portion — "
-                        f"Page "
-                        f"{page['page_number']}"
-                    ),
-
-                    "mime_type":
-                    "image/png",
-
-                    "page_number":
-                    page["page_number"],
-                })
-
-        extra_context = "\n\n".join(
-
-            page.get(
+            segment.get(
                 "text",
                 ""
             )
-
-            for page in pages
         )
 
-    # --------------------------------------------------------
-    # DOCX / PPTX
-    # --------------------------------------------------------
-
-    elif source_type in {
-        "docx",
-        "pptx",
-    }:
-
-        pages = find_relevant_pdf_pages(
-
-            question,
-
-            source.get(
-                "pdf_pages",
-                []
-            ),
-
-            max_pages=2
-        )
-
-        render_pdf_bytes = source.get(
-            "render_pdf_bytes"
-        )
-
-        if render_pdf_bytes:
-
-            for page in pages:
-
-                image_bytes = (
-                    render_pdf_relevant_crop(
-
-                        render_pdf_bytes,
-
-                        page["page_number"],
-
-                        question
-                    )
-                )
-
-                if image_bytes:
-
-                    label = (
-                        "DOCX"
-                        if source_type == "docx"
-                        else "PPTX"
-                    )
-
-                    media.append({
-
-                        "type":
-                        "image",
-
-                        "data":
-                        image_bytes,
-
-                        "caption":
-                        (
-                            "📄 Exact relevant "
-                            f"{label} portion — "
-                            f"Page/Slide "
-                            f"{page['page_number']}"
-                        ),
-
-                        "mime_type":
-                        "image/png",
-
-                        "page_number":
-                        page["page_number"],
-                    })
-
-        extra_context = "\n\n".join(
-
-            page.get(
-                "text",
-                ""
-            )
-
-            for page in pages
-        )
-
-    # --------------------------------------------------------
-    # VIDEO
-    # --------------------------------------------------------
-
-    elif source_type == "video":
-
-        segments = (
-            find_relevant_video_segments(
-
-                question,
-
-                source.get(
-                    "video_segments",
-                    []
-                ),
-
-                max_segments=2
+        scored.append(
+            (
+                score,
+                segment
             )
         )
 
-        video_path = source.get(
-            "video_path"
+    scored.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    selected = []
+
+    for score, segment in scored:
+
+        if score <= 0:
+
+            continue
+
+        selected.append(
+            segment
         )
 
-        if (
-            video_path
-            and
-            os.path.exists(video_path)
-        ):
+        if len(selected) >= max_segments:
 
-            for segment in segments:
+            break
 
-                duration = (
-                    segment["end"]
-                    -
-                    segment["start"]
-                )
+    # IMPORTANT:
+    # If no exact text match,
+    # still return the best transcript segments.
 
-                timestamp = (
-                    segment["start"]
-                    +
-                    max(
-                        0.1,
-                        duration * 0.45
-                    )
-                )
+    if not selected:
 
-                frame = (
-                    extract_video_frame(
+        selected = [
 
-                        video_path,
+            segment
 
-                        timestamp
-                    )
-                )
+            for _, segment in scored[
+                :max_segments
+            ]
+        ]
 
-                if frame:
+    return selected
 
-                    media.append({
 
-                        "type":
-                        "image",
+# ============================================================
+# LANGUAGE INSTRUCTION
+# ============================================================
 
-                        "data":
-                        frame,
+def get_language_instruction(
+    language_code
+):
 
-                        "caption":
-                        (
-                            "🎬 Exact relevant "
-                            "video frame at "
-                            f"{format_timestamp(timestamp)}"
-                        ),
+    language_name = LANGUAGE_NAMES.get(
+        language_code,
+        "English"
+    )
 
-                        "timestamp":
-                        timestamp,
+    if language_code == "bn":
 
-                        "video_text":
-                        segment.get(
-                            "text",
-                            ""
-                        ),
+        return """
+CRITICAL LANGUAGE RULE — BENGALI
 
-                        "mime_type":
-                        "image/jpeg",
-                    })
+The current user question is Bengali.
 
-        extra_context = "\n".join(
+If the user wrote Bengali using Bengali script,
+answer in Bengali script.
 
-            f"[{format_timestamp(s['start'])}] "
-            f"{s.get('text', '')}"
+If the user wrote Bengali using English/Roman letters
+(Banglish/Romanized Bengali), answer in
+Romanized Bengali/Banglish.
 
-            for s in segments
-        )
+Examples:
 
-    # --------------------------------------------------------
-    # WEBSITE
-    # --------------------------------------------------------
+"এটা কী?"
+→ Bengali script
 
-    elif source_type == "website":
+"eta ki?"
+→ Romanized Bengali
 
-        website_media, website_context = (
-            get_website_question_source(
+"tumi kemon acho?"
+→ Romanized Bengali
 
-                question,
+Do NOT automatically convert Romanized Bengali
+into Bengali script.
 
-                source
-            )
-        )
+The uploaded document language MUST NOT determine
+the response language.
+"""
 
-        media.extend(
-            website_media
-        )
+    if language_code == "hi":
 
-        extra_context = (
-            website_context
-        )
+        return """
+CRITICAL LANGUAGE RULE — HINDI
 
-    # --------------------------------------------------------
-    # IMAGE
-    # --------------------------------------------------------
+The current user question is Hindi.
 
-    elif source_type == "image":
+If the user uses Devanagari,
+answer in Devanagari.
 
-        image_data = source.get(
-            "file_bytes",
-            b""
-        )
+If the user uses Romanized Hindi/Hinglish,
+answer naturally in Romanized Hindi/Hinglish.
 
-        if image_data:
+The uploaded document language MUST NOT determine
+the response language.
+"""
 
-            image_extensions = {
+    if language_code == "en":
 
-                ".jpg":
-                "image/jpeg",
+        return """
+CRITICAL LANGUAGE RULE — ENGLISH
 
-                ".jpeg":
-                "image/jpeg",
+The current user question is English.
 
-                ".png":
-                "image/png",
+Answer completely in natural English.
 
-                ".webp":
-                "image/webp",
+The uploaded document language MUST NOT
+change the response language.
+"""
 
-                ".gif":
-                "image/gif",
-            }
+    return f"""
+CRITICAL LANGUAGE RULE
 
-            mime = image_extensions.get(
+The current user question is written in
+{language_name}.
 
-                source.get(
-                    "extension",
-                    ".png"
-                ).lower(),
+Answer naturally in {language_name}.
 
-                "image/png"
-            )
+The uploaded source language MUST NOT
+change the response language.
 
-            media.append({
-
-                "type":
-                "image",
-
-                "data":
-                image_data,
-
-                "caption":
-                "🖼️ Uploaded image",
-
-                "mime_type":
-                mime,
-
-                "already_sent":
-                True,
-            })
-
-    return media, extra_context
+Never switch to English unless the user
+explicitly asks for English.
+"""
 
 
 # ============================================================
@@ -4887,7 +3343,9 @@ def get_question_source_media(
 def build_history():
 
     recent = (
-        st.session_state.messages[-12:]
+        st.session_state.messages[
+            -12:
+        ]
     )
 
     history = []
@@ -4905,6 +3363,7 @@ def build_history():
         )
 
         if not content:
+
             continue
 
         if role == "user":
@@ -4925,7 +3384,7 @@ def build_history():
 
 
 # ============================================================
-# GEMINI GENERATION
+# GEMINI REQUEST
 # ============================================================
 
 def generate_with_model(
@@ -4933,22 +3392,25 @@ def generate_with_model(
     prompt,
     image_part=None,
     file_part=None,
-    extra_parts=None
+    extra_parts=None,
 ):
 
     contents = []
 
     if image_part is not None:
+
         contents.append(
             image_part
         )
 
     if file_part is not None:
+
         contents.append(
             file_part
         )
 
     if extra_parts:
+
         contents.extend(
             extra_parts
         )
@@ -4961,7 +3423,7 @@ def generate_with_model(
 
         model=model_name,
 
-        contents=contents
+        contents=contents,
     )
 
     if response is None:
@@ -4986,7 +3448,7 @@ def generate_with_model(
 
 
 # ============================================================
-# RETRYABLE GEMINI ERROR
+# RETRY CHECK
 # ============================================================
 
 def is_retryable_gemini_error(
@@ -4995,9 +3457,9 @@ def is_retryable_gemini_error(
 
     text = str(
         error
-    ).lower()
+    ).upper()
 
-    retry_words = [
+    retry_codes = [
 
         "429",
         "500",
@@ -5005,107 +3467,189 @@ def is_retryable_gemini_error(
         "503",
         "504",
 
-        "resource exhausted",
-        "rate limit",
-        "temporarily unavailable",
-        "internal server error",
-        "deadline exceeded",
-        "timeout",
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "INTERNAL",
+        "BAD_GATEWAY",
+        "DEADLINE",
+        "TIMEOUT",
+
+        "RATE LIMIT",
+        "TOO MANY REQUESTS",
     ]
 
     return any(
-        word in text
-        for word in retry_words
+        code in text
+        for code in retry_codes
     )
 
 
 # ============================================================
-# ASK GEMINI
+# GEMINI
 # ============================================================
 
 def ask_gemini(
     prompt,
     image_part=None,
     file_part=None,
-    extra_parts=None
+    extra_parts=None,
 ):
+    """
+    Ask Gemini with retry + fallback support.
+
+    The primary model is GEMINI_MODEL (normally gemini-3.5-flash).
+    Temporary 429/5xx/unavailable errors are retried briefly and then
+    the configured fallback model(s) are tried.
+
+    Existing multimodal support is preserved through image_part,
+    file_part and extra_parts.
+    """
 
     models = []
 
     if GEMINI_MODEL:
+        models.append(GEMINI_MODEL)
 
-        models.append(
-            GEMINI_MODEL
+    for fallback in FALLBACK_MODELS:
+        if fallback and fallback not in models:
+            models.append(fallback)
+
+    if not models:
+        raise RuntimeError(
+            "No Gemini model has been configured."
         )
-
-    for model in FALLBACK_MODELS:
-
-        if model not in models:
-
-            models.append(
-                model
-            )
 
     last_error = None
 
-    for model_index, model_name in enumerate(
-        models
-    ):
+    for model_index, model_name in enumerate(models):
 
-        attempts = (
-            3
-            if model_index == 0
-            else 2
-        )
+        # Try each model at most twice. This lets the fallback model
+        # be reached quickly when the primary model is temporarily busy.
+        max_attempts = 2
 
-        for attempt in range(
-            attempts
-        ):
+        for attempt in range(max_attempts):
 
             try:
+                print(
+                    f"Gemini request | "
+                    f"model={model_name} | "
+                    f"attempt={attempt + 1}"
+                )
 
-                return generate_with_model(
-
+                result = generate_with_model(
                     model_name=model_name,
-
                     prompt=prompt,
-
                     image_part=image_part,
-
                     file_part=file_part,
-
                     extra_parts=extra_parts,
                 )
 
-            except Exception as e:
+                if result:
+                    return result
 
+                raise RuntimeError(
+                    "Gemini returned an empty response."
+                )
+
+            except Exception as e:
                 last_error = e
 
                 print(
-                    "Gemini error:",
-                    model_name,
-                    repr(e)
+                    f"Gemini error | "
+                    f"model={model_name} | "
+                    f"attempt={attempt + 1} | "
+                    f"error={repr(e)}"
                 )
 
-                if not is_retryable_gemini_error(
-                    e
-                ):
+                if not is_retryable_gemini_error(e):
+                    raise RuntimeError(
+                        f"Gemini API error: {e}"
+                    ) from e
 
-                    break
-
-                if attempt < attempts - 1:
-
-                    time.sleep(
-                        2 ** attempt
+                if attempt < max_attempts - 1:
+                    delay = min(
+                        3 * (2 ** attempt),
+                        10,
                     )
 
-    raise RuntimeError(
+                    print(
+                        f"Gemini retrying in {delay} seconds..."
+                    )
+                    time.sleep(delay)
 
-        str(last_error)
-        if last_error
-        else
-        "Gemini request failed."
+        # If this model was exhausted, continue to the next fallback.
+        if model_index < len(models) - 1:
+            print(
+                f"Gemini model unavailable: {model_name}. "
+                f"Trying fallback model: {models[model_index + 1]}"
+            )
+
+    raise RuntimeError(
+        "Gemini API is temporarily unavailable.\n\n"
+        f"Last error: {last_error}"
     )
+
+
+# ============================================================
+# GET SOURCE CONTEXT + VISUAL
+# ============================================================
+
+
+def get_question_source_media(question):
+    source=st.session_state.source_data
+    if not source:
+        return [], ""
+    source_type=source.get("source_type")
+    media=[]
+    extra_context=""
+
+    if source_type == "pdf":
+        pages=find_relevant_pdf_pages(question,source.get("pdf_pages",[]),max_pages=2)
+        for page in pages:
+            image_bytes=render_pdf_page(source["file_bytes"],page["page_number"])
+            if image_bytes:
+                media.append({"type":"image","data":image_bytes,
+                              "caption":f"📄 Relevant PDF page {page['page_number']}","mime_type":"image/png"})
+
+    elif source_type in {"docx","pptx"}:
+        pages=find_relevant_pdf_pages(question,source.get("pdf_pages",[]),max_pages=2)
+        render_pdf_bytes=source.get("render_pdf_bytes")
+        if render_pdf_bytes:
+            for page in pages:
+                image_bytes=render_pdf_page(render_pdf_bytes,page["page_number"])
+                if image_bytes:
+                    label="DOCX page" if source_type=="docx" else "PPTX slide"
+                    media.append({"type":"image","data":image_bytes,
+                                  "caption":f"📄 Relevant {label} {page['page_number']}","mime_type":"image/png"})
+
+    elif source_type == "video":
+        segments=find_relevant_video_segments(question,source.get("video_segments",[]),max_segments=2)
+        video_path=source.get("video_path")
+        if video_path and os.path.exists(video_path):
+            for segment in segments:
+                timestamp=segment["start"]+(segment["end"]-segment["start"])/2
+                frame=extract_video_frame(video_path,timestamp)
+                if frame:
+                    media.append({"type":"image","data":frame,
+                                  "caption":f"🎬 Relevant video frame at {format_timestamp(timestamp)}",
+                                  "timestamp":timestamp,"video_text":segment["text"],"mime_type":"image/jpeg"})
+
+    elif source_type == "website":
+        website_media, website_context=get_website_question_source(question,source)
+        media.extend(website_media)
+        extra_context=website_context
+
+    elif source_type == "image":
+        image_data=source.get("file_bytes",b"")
+        if image_data:
+            image_extensions={".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png",
+                              ".webp":"image/webp",".gif":"image/gif"}
+            mime=image_extensions.get(source.get("extension",".png").lower(),"image/png")
+            media.append({"type":"image","data":image_data,"caption":"🖼️ Uploaded image",
+                          "mime_type":mime,"already_sent":True})
+
+    return media, extra_context
+
 
 
 # ============================================================
@@ -5116,7 +3660,6 @@ def ask_ai(
     user_message,
     language_code,
     relevant_media=None,
-    source_context=""
 ):
 
     if language_code not in LANGUAGE_NAMES:
@@ -5124,7 +3667,7 @@ def ask_ai(
         language_code = "en"
 
     # --------------------------------------------------------
-    # Detect CURRENT question again
+    # ALWAYS DETECT LANGUAGE FROM CURRENT QUESTION
     # --------------------------------------------------------
 
     detected_question_language = (
@@ -5133,10 +3676,7 @@ def ask_ai(
         )
     )
 
-    if (
-        detected_question_language
-        in LANGUAGE_NAMES
-    ):
+    if detected_question_language in LANGUAGE_NAMES:
 
         language_code = (
             detected_question_language
@@ -5162,25 +3702,27 @@ def ask_ai(
     uploaded_context = ""
 
     image_part = None
+
     file_part = None
+
     extra_parts = []
 
     source_instruction = ""
 
-    # --------------------------------------------------------
-    # Relevant visual media
-    # --------------------------------------------------------
+    # ========================================================
+    # ADD RELEVANT VISUALS TO GEMINI
+    # ========================================================
 
     if relevant_media:
 
         for media in relevant_media:
 
+            # Uploaded image is already
+            # supplied using image_part.
             if media.get(
                 "already_sent"
             ):
 
-                # Uploaded image is sent
-                # through image_part below.
                 continue
 
             image_data = media.get(
@@ -5198,11 +3740,9 @@ def ask_ai(
                             data=image_data,
 
                             mime_type=media.get(
-
                                 "mime_type",
-
                                 "image/png"
-                            )
+                            ),
                         )
                     )
 
@@ -5213,9 +3753,9 @@ def ask_ai(
                         repr(e)
                     )
 
-    # --------------------------------------------------------
-    # Source
-    # --------------------------------------------------------
+    # ========================================================
+    # SOURCE
+    # ========================================================
 
     if source:
 
@@ -5254,7 +3794,7 @@ Source name:
 {filename}
 
 Use the uploaded source only when relevant
-to the CURRENT USER QUESTION.
+to the current user question.
 
 Do not invent information.
 
@@ -5263,6 +3803,7 @@ the answer language.
 
 The CURRENT USER QUESTION determines
 the answer language.
+
 """
 
         if uploaded_context:
@@ -5271,141 +3812,109 @@ the answer language.
 
 SOURCE TEXT / TRANSCRIPT:
 
-{uploaded_context[:MAX_SOURCE_TEXT]}
+{uploaded_context[:50000]}
 
 ============================================================
 END SOURCE TEXT
 ============================================================
 """
 
-    # --------------------------------------------------------
-    # Exact source context
-    # --------------------------------------------------------
-
-    if source_context:
-
-        source_instruction += f"""
-
-============================================================
-EXACTLY SELECTED SOURCE CONTEXT
-============================================================
-
-The following content was selected specifically
-for the CURRENT USER QUESTION.
-
-Use it as the highest-relevance source context.
-
-{source_context[:20000]}
-
-============================================================
-END EXACTLY SELECTED SOURCE CONTEXT
-============================================================
-"""
-
-    # --------------------------------------------------------
-    # Source-specific rules
-    # --------------------------------------------------------
-
-    if source:
-
-        source_type = source.get(
-            "source_type"
-        )
+        # ----------------------------------------------------
+        # VIDEO
+        # ----------------------------------------------------
 
         if source_type == "video":
 
             source_instruction += """
 
-VIDEO RULES:
+This is a video source.
 
-The uploaded video has been transcribed
-with timestamps.
+The transcript contains timestamps.
 
-Relevant video frames may be attached.
+When answering a question about the video,
+use the transcript to identify the relevant
+part of the video.
 
-Use the actual transcript and actual
-frames when answering.
+Relevant video frames may also be provided
+as visual context.
+
+If a timestamp is useful, mention the relevant
+timestamp naturally.
 
 Do not invent timestamps.
-
-If useful, mention the relevant timestamp.
 """
+
+        # ----------------------------------------------------
+        # WEBSITE
+        # ----------------------------------------------------
 
         elif source_type == "website":
 
             source_instruction += """
 
-WEBSITE RULES:
+This is a website source.
 
-The user supplied a website URL.
+Use the extracted website content to answer.
 
-Use the analyzed website content.
+Relevant website screenshots may be provided
+as visual context.
 
-If an exact website screenshot is attached,
-inspect the actual screenshot carefully.
-
-The screenshot comes from the actual
-rendered website DOM.
-
-Do not generate or imagine a replacement
-website screenshot.
-
-Do not claim that a different website area
-was inspected.
-
-If the exact screenshot contains the answer,
-prioritize it.
-
-If necessary, use the analyzed website text
-as supporting context.
+Only discuss information actually available
+on the website.
 """
+
+        # ----------------------------------------------------
+        # DOCUMENT
+        # ----------------------------------------------------
 
         elif source_type in {
             "pdf",
             "docx",
-            "pptx",
+            "pptx"
         }:
 
             source_instruction += """
 
-DOCUMENT RULES:
+This is a document source.
 
-Use the uploaded document content.
+Use the document content to answer.
 
-If an exact relevant page/slide crop
-is attached, inspect that visual carefully.
+Relevant document pages or slides may be
+provided as visual context.
 
-The screenshot is an actual rendering
-of the original document.
-
-Do not invent visual information.
-
-If the exact crop contains the answer,
-prioritize it.
+When visual information is important,
+inspect the provided page/slide image.
 """
+
+        # ----------------------------------------------------
+        # IMAGE
+        # ----------------------------------------------------
 
         elif source_type == "image":
 
             source_instruction += """
 
-IMAGE RULES:
+This is an uploaded image.
 
 Inspect the uploaded image carefully.
 
-Answer only using information supported
-by the image and relevant user context.
+Use visual information from the image
+when answering the current question.
 
-Do not invent unsupported visual details.
+Do not assume information that cannot
+be seen or reasonably inferred from
+the image.
 """
 
-    # --------------------------------------------------------
-    # Prompt
-    # --------------------------------------------------------
+    # ========================================================
+    # FINAL PROMPT
+    # ========================================================
 
     prompt = f"""
 You are a professional multilingual AI voice assistant.
 
-{language_instruction}
+You answer questions using conversation context,
+uploaded sources, and relevant visual context.
 
 ============================================================
 CURRENT USER QUESTION
@@ -5426,8 +3935,8 @@ Priority:
 3. Conversation context
 4. Uploaded source
 
-The uploaded source language must NEVER override
-the current user question language.
+The source language MUST NEVER override
+the current question language.
 
 ============================================================
 DETECTED LANGUAGE
@@ -5440,74 +3949,142 @@ Language:
 {language_name}
 
 ============================================================
+LANGUAGE RULE
+============================================================
+
+{language_instruction}
+
+============================================================
 ABSOLUTE CURRENT-QUESTION LANGUAGE RULE
 ============================================================
 
-Answer the CURRENT USER QUESTION in the SAME
-language/style used by the user.
+Answer the user's CURRENT QUESTION in the
+same language/style used by the user.
 
-If the user writes Banglish, answer in natural Banglish.
+Do NOT answer according to the language
+of the uploaded document.
 
-If the user writes Bengali script, answer in Bengali script.
+Do NOT answer according to the language
+of the uploaded PDF.
 
-If the user writes Hinglish, answer in natural Hinglish.
+Do NOT answer according to the language
+of the uploaded DOCX.
 
-If the user writes Hindi script, answer in Hindi script.
+Do NOT answer according to the language
+of the uploaded PPTX.
 
-If the user writes English, answer in English.
+Do NOT answer according to the language
+of the uploaded image.
 
-Never automatically translate the answer into
-the source language.
+Do NOT answer according to the language
+of the uploaded video.
 
-Do not change Banglish into Bengali script unless
-the user explicitly asks for Bengali script.
+Do NOT answer according to the language
+of the website.
 
-Do not change Hinglish into Hindi script unless
-the user explicitly asks for Hindi script.
+The CURRENT USER QUESTION has the highest
+language priority.
+
+Examples:
+
+User asks in English + Bengali PDF
+→ Answer in English.
+
+User asks in Banglish + English PDF
+→ Answer in Banglish.
+
+User asks in Bengali script + English PDF
+→ Answer in Bengali script.
+
+User asks in Hinglish + English document
+→ Answer in Hinglish.
+
+User asks in Hindi Devanagari + English document
+→ Answer in Hindi Devanagari.
 
 ============================================================
-EXACT SOURCE VISUAL RULE
+IMPORTANT
 ============================================================
 
-If an exact source screenshot is attached:
+If the user writes Roman Bengali/Banglish,
+answer in Roman Bengali/Banglish.
 
-1. Treat it as the actual source visual.
-2. Inspect it carefully.
-3. Answer using the exact visible content.
-4. Do not claim that another area was inspected.
-5. Do not invent details outside the visible source.
-6. If the screenshot contains the answer, prioritize it.
-7. If the screenshot does not contain enough information,
-   use the source text/context.
-8. Never generate or imagine a replacement screenshot.
+If the user writes Bengali script,
+answer in Bengali script.
 
-For websites, the screenshot is captured from the
-actual rendered website DOM position.
+If the user writes Roman Hindi/Hinglish,
+answer in Roman Hindi/Hinglish.
 
-For PDFs, the screenshot is an actual crop from
-the original PDF page.
+If the user writes Hindi Devanagari,
+answer in Hindi Devanagari.
 
-For DOCX/PPTX, the screenshot is an actual crop
-from the rendered document/slide.
+If the user writes English,
+answer in English.
 
-For videos, the screenshot is an actual frame
-extracted from the uploaded video.
+Do not translate unless requested.
+
+Do not switch language because
+the source is in English.
+
+Do not switch language because
+the source is in Bengali.
+
+Do not switch language because
+the source is in Hindi.
+
+Do not switch language because
+the source is in any other language.
 
 ============================================================
 GENERAL BEHAVIOUR
 ============================================================
 
-- Be accurate.
-- Be helpful.
-- Do not invent facts.
-- Prefer source evidence when a source is available.
-- If the source does not contain the answer,
-  clearly say so.
-- Do not mention internal implementation details
-  unless the user asks.
-- Answer directly.
-- Keep the answer reasonably concise unless
-  the user asks for detail.
+1. Answer the actual question.
+
+2. Use the uploaded source when relevant.
+
+3. Do not invent information.
+
+4. Keep answers reasonably concise.
+
+5. For technical questions,
+   explain clearly.
+
+6. If code is requested,
+   provide complete code when appropriate.
+
+7. The answer will be spoken aloud,
+   so use natural conversational sentences.
+
+8. Do not add unnecessary language labels.
+
+9. Do not explain language detection.
+
+10. Do not provide multiple translations.
+
+11. Do not say "Here is the translation."
+
+12. Directly answer the user.
+
+13. For video questions, use the transcript,
+    relevant visual frame and timestamps
+    when relevant.
+
+14. For document questions, use relevant
+    document content and relevant page/slide
+    visual context when available.
+
+15. For website questions, use relevant
+    website content and relevant screenshot
+    when available.
+
+16. For image questions, inspect the uploaded
+    image and answer based on visible content.
+
+17. Never claim that a screenshot/frame/page
+    was inspected if no visual was provided.
+
+18. Never invent a timestamp.
 
 ============================================================
 RECENT CONVERSATION
@@ -5522,16 +4099,29 @@ SOURCE INFORMATION
 {source_instruction}
 
 ============================================================
+VISUAL CONTEXT
+============================================================
+
+Relevant screenshots, document pages,
+slides, video frames, or uploaded images
+may be attached separately to this request.
+
+Use those visuals when relevant to the
+current question.
+
+============================================================
 ABSOLUTE LANGUAGE LOCK
 ============================================================
 
-Answer ONLY in the language/style of the CURRENT USER QUESTION.
+Answer ONLY in the language/style of the
+CURRENT USER QUESTION.
 
 Current language:
 {language_name}
 
-Never allow the uploaded source language
-to override the answer language.
+Never allow the uploaded document,
+PDF, DOCX, PPTX, image, video or website
+language to override this.
 
 Return ONLY the actual answer.
 """
@@ -5544,7 +4134,7 @@ Return ONLY the actual answer.
 
         file_part=file_part,
 
-        extra_parts=extra_parts
+        extra_parts=extra_parts,
     )
 
 
@@ -5557,21 +4147,17 @@ def text_to_speech(
     language_code
 ):
 
-    if not text:
-        return None
-
-    try:
-
-        import edge_tts
-
-    except Exception as e:
+    if not text or not text.strip():
 
         print(
-            "TTS import error:",
-            repr(e)
+            "TTS ERROR: Empty text."
         )
 
         return None
+
+    if language_code not in TTS_VOICES:
+
+        language_code = "en"
 
     voice = TTS_VOICES.get(
 
@@ -5580,47 +4166,103 @@ def text_to_speech(
         TTS_VOICES["en"]
     )
 
-    output_path = os.path.join(
+    output_file = os.path.join(
 
         tempfile.gettempdir(),
 
         f"tts_{uuid.uuid4().hex}.mp3"
     )
 
-    async def generate():
+    command = [
 
-        communicator = edge_tts.Communicate(
+        sys.executable,
 
-            text,
+        "-m",
+        "edge_tts",
 
-            voice
-        )
+        "--voice",
+        voice,
 
-        await communicator.save(
-            output_path
-        )
+        "--text",
+        text.strip(),
+
+        "--write-media",
+        output_file,
+    ]
 
     try:
 
-        import asyncio
+        result = subprocess.run(
 
-        asyncio.run(
-            generate()
+            command,
+
+            stdout=subprocess.PIPE,
+
+            stderr=subprocess.PIPE,
+
+            text=True,
+
+            encoding="utf-8",
+
+            errors="replace",
+
+            timeout=120,
         )
 
-        if (
-            not os.path.exists(
-                output_path
+        if result.stdout:
+
+            print(
+                "TTS STDOUT:",
+                result.stdout
             )
-            or
-            os.path.getsize(
-                output_path
-            ) < 100
+
+        if result.stderr:
+
+            print(
+                "TTS STDERR:",
+                result.stderr
+            )
+
+        if result.returncode != 0:
+
+            print(
+                "TTS ERROR: edge-tts failed."
+            )
+
+            return None
+
+        if not os.path.exists(
+            output_file
         ):
 
             return None
 
-        return output_path
+        file_size = os.path.getsize(
+            output_file
+        )
+
+        if file_size < 1000:
+
+            try:
+
+                os.remove(
+                    output_file
+                )
+
+            except Exception:
+                pass
+
+            return None
+
+        return output_file
+
+    except subprocess.TimeoutExpired:
+
+        print(
+            "TTS ERROR: timeout."
+        )
+
+        return None
 
     except Exception as e:
 
@@ -5633,39 +4275,24 @@ def text_to_speech(
 
 
 # ============================================================
-# SESSION DEFAULTS
+# SESSION STATE
 # ============================================================
 
 DEFAULTS = {
-
-    "active_session_id": None,
-
-    "messages_loaded": False,
-
     "messages": [],
-
+    "db_session_id": "",
+    "db_loaded": False,
     "pending_transcript": "",
-
     "pending_language": "en",
-
     "recorder_key": 0,
-
     "voice_ready": False,
-
     "source_data": None,
-
     "source_filename": "",
-
     "website_url_input": "",
-
     "website_login_required": False,
-
     "website_login_url": "",
-
     "website_original_url": "",
-
     "website_authenticated": False,
-
     "pending_website_question": "",
 }
 
@@ -5678,92 +4305,46 @@ for key, value in DEFAULTS.items():
 
 
 # ============================================================
-# DATABASE SESSION INITIALIZATION
+# SQL DATABASE SESSION
 # ============================================================
 
-def ensure_active_session():
+def init_sql_session():
+    """Create/load the persistent SQL chat session once per Streamlit session."""
+    if st.session_state.get("db_loaded"):
+        return
 
-    active_id = st.session_state.get("active_session_id")
-
-    if active_id and db_get_session(active_id):
-        if not st.session_state.get("messages_loaded", False):
-            st.session_state.messages = db_load_messages(active_id)
-            st.session_state.messages_loaded = True
-        return active_id
-
-    sessions = db_list_sessions(limit=1)
-
-    if sessions:
-        active_id = sessions[0]["id"]
-    else:
-        active_id = db_create_session("New Chat")
-
-    st.session_state.active_session_id = active_id
-    st.session_state.messages = db_load_messages(active_id)
-    st.session_state.messages_loaded = True
-    return active_id
-
-
-ensure_active_session()
+    try:
+        session_id = st.session_state.get("db_session_id") or create_session()
+        st.session_state.db_session_id = session_id
+        st.session_state.messages = load_messages(session_id)
+        st.session_state.db_loaded = True
+        print("SQL DATABASE: session loaded", session_id)
+    except Exception as e:
+        st.session_state.db_loaded = True
+        print("SQL DATABASE LOAD ERROR:", repr(e))
 
 
 # ============================================================
 # CLEAR SOURCE
 # ============================================================
 
+
 def clear_source():
-
-    source = (
-        st.session_state.source_data
-    )
-
+    source=st.session_state.get("source_data")
     if source:
-
-        video_path = source.get(
-            "video_path"
-        )
-
-        if (
-            video_path
-            and
-            os.path.exists(video_path)
-        ):
-
+        video_path=source.get("video_path")
+        if video_path:
             try:
+                if os.path.exists(video_path): os.remove(video_path)
+            except Exception: pass
+    st.session_state.source_data=None
+    st.session_state.source_filename=""
+    st.session_state.website_login_required=False
+    st.session_state.website_login_url=""
+    st.session_state.website_original_url=""
+    st.session_state.website_authenticated=False
+    st.session_state.pending_website_question=""
 
-                os.remove(
-                    video_path
-                )
-
-            except Exception:
-                pass
-
-    st.session_state.source_data = None
-
-    st.session_state.source_filename = ""
-
-    st.session_state.website_login_required = False
-
-    st.session_state.website_login_url = ""
-
-    st.session_state.website_original_url = ""
-
-    st.session_state.website_authenticated = False
-
-    st.session_state.pending_website_question = ""
-
-    # Clear login fields if they exist
-    for key in (
-        "website_login_id",
-        "website_login_password",
-    ):
-
-        if key in st.session_state:
-
-            try:
-                del st.session_state[key]
-            except Exception:
-                pass
 
 
 # ============================================================
@@ -5772,290 +4353,98 @@ def clear_source():
 
 def start_new_chat():
 
-    active_id = db_create_session("New Chat")
-
-    st.session_state.active_session_id = active_id
     st.session_state.messages = []
-    st.session_state.messages_loaded = True
+
     st.session_state.pending_transcript = ""
+
     st.session_state.pending_language = "en"
-    st.session_state.recorder_key += 1
+
     st.session_state.voice_ready = False
+
     clear_source()
+
+    try:
+        st.session_state.db_session_id = create_session()
+        touch_session(st.session_state.db_session_id, "New Chat")
+    except Exception as e:
+        print("SQL DATABASE NEW SESSION ERROR:", repr(e))
+
+    st.session_state.recorder_key += 1
 
 
 # ============================================================
 # PROCESS USER MESSAGE
 # ============================================================
 
-def process_user_message(
-    user_message,
-    language_code
-):
 
-    if not user_message:
-        return
+def process_user_message(user_message, language_code):
+    if not user_message: return
+    user_message=user_message.strip()
+    if not user_message: return
+    detected=detect_text_language(user_message)
+    if detected in LANGUAGE_NAMES: language_code=detected
+    if language_code not in LANGUAGE_NAMES: language_code="en"
 
-    user_message = (
-        user_message.strip()
-    )
-
-    if not user_message:
-        return
-
-    detected = detect_text_language(
-        user_message
-    )
-
-    if detected in LANGUAGE_NAMES:
-
-        language_code = detected
-
-    if language_code not in LANGUAGE_NAMES:
-
-        language_code = "en"
-
-    # --------------------------------------------------------
-    # Find exact source media
-    # --------------------------------------------------------
-
-    relevant_media = []
-
-    source_context = ""
-
+    relevant_media=[]
+    source_context=""
     try:
-
-        (
-            relevant_media,
-            source_context
-        ) = get_question_source_media(
-
-            user_message
-        )
-
+        relevant_media,source_context=get_question_source_media(user_message)
     except Exception as e:
+        print("SOURCE MEDIA ERROR:",repr(e))
 
-        print(
-            "SOURCE MEDIA ERROR:",
-            repr(e)
-        )
-
-    # --------------------------------------------------------
-    # Website login
-    # --------------------------------------------------------
-
-    login_items = [
-
-        m
-
-        for m in relevant_media
-
-        if (
-            isinstance(
-                m,
-                dict
-            )
-            and
-            m.get(
-                "type"
-            )
-            ==
-            "website_login_required"
-        )
-    ]
-
+    login_items=[m for m in relevant_media if isinstance(m,dict) and m.get("type")=="website_login_required"]
     if login_items:
-
-        st.session_state[
-            "pending_website_question"
-        ] = user_message
-
-        st.session_state[
-            "website_login_required"
-        ] = True
-
-        st.session_state[
-            "website_login_url"
-        ] = (
-
-            login_items[0].get(
-                "login_url"
-            )
-
-            or
-
-            st.session_state.get(
-                "website_url_input",
-                ""
-            )
-        )
-
-        st.warning(
-
-            "🔐 This page requires login. "
-            "Please enter your Login ID/Email/Username "
-            "and Password above."
-        )
-
+        st.session_state.pending_website_question=user_message
+        st.session_state.website_login_required=True
+        st.session_state.website_login_url=login_items[0].get("login_url") or st.session_state.get("website_url_input","")
+        st.warning("🔐 This page requires login. Please enter your Login ID/Email/Username and Password above.")
         return
 
-    # --------------------------------------------------------
-    # Add user message
-    # --------------------------------------------------------
-
-    st.session_state.messages.append({
-
-        "role":
-        "user",
-
-        "content":
-        user_message,
-
-        "language":
-        language_code,
-    })
-
-    # Persist the user message immediately.
-    session_id = ensure_active_session()
-    db_save_message(
-        session_id,
-        "user",
-        user_message,
-        language_code,
-    )
-
-    current_session = db_get_session(session_id)
-    if current_session and current_session.get("title") == "New Chat":
-        db_update_session_title(
-            session_id,
-            user_message[:80].strip() or "New Chat"
-        )
-
+    user_record = {"role": "user", "content": user_message, "language": language_code}
+    st.session_state.messages.append(user_record)
     try:
-
-        with st.spinner(
-            "🤖 Thinking..."
-        ):
-
-            response = ask_ai(
-
-                user_message=user_message,
-
-                language_code=language_code,
-
-                relevant_media=relevant_media,
-
-                source_context=source_context,
-            )
-
+        save_message(
+            st.session_state.get("db_session_id"),
+            "user",
+            user_message,
+            language=language_code,
+        )
     except Exception as e:
-
-        st.error(
-            "❌ Gemini request failed."
-        )
-
-        print(
-            "GEMINI ERROR:",
-            repr(e)
-        )
-
-        if (
-
-            st.session_state.messages
-
-            and
-
-            st.session_state.messages[-1].get(
-                "role"
-            )
-            ==
-            "user"
-        ):
-
+        print("SQL USER MESSAGE SAVE ERROR:", repr(e))
+    maybe_update_chat_title(user_message)
+    try:
+        with st.spinner("🤖 Thinking..."):
+            response=ask_ai(user_message=user_message,language_code=language_code,relevant_media=relevant_media)
+    except Exception as e:
+        st.error("❌ Gemini request failed.")
+        print("GEMINI ERROR:",repr(e))
+        if st.session_state.messages and st.session_state.messages[-1].get("role")=="user":
             st.session_state.messages.pop()
-
-        st.exception(
-            RuntimeError(
-                str(e)
-            )
-        )
-
+        st.exception(RuntimeError(str(e)))
         return
 
-    assistant_message = {
-
-        "role":
-        "assistant",
-
-        "content":
-        response,
-
-        "tts_language":
-        language_code,
-
-        "source_media":
-        relevant_media,
-    }
-
+    assistant_message={"role":"assistant","content":response,"tts_language":language_code,"source_media":relevant_media}
     for media in relevant_media:
-
-        if media.get(
-            "timestamp"
-        ) is not None:
-
-            assistant_message.setdefault(
-                "timestamps",
-                []
-            ).append(
-                media[
-                    "timestamp"
-                ]
-            )
-
-    st.session_state.messages.append(
-        assistant_message
-    )
-
-    # Persist answer + exact source visuals in SQL.
-    db_save_message(
-        session_id,
-        "assistant",
-        response,
-        language_code,
-        relevant_media,
-    )
-
-    # --------------------------------------------------------
-    # TTS
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "🔊 Generating voice..."
-    ):
-
-        audio_file = text_to_speech(
-
-            text=response,
-
-            language_code=language_code
+        if media.get("timestamp") is not None:
+            assistant_message.setdefault("timestamps",[]).append(media["timestamp"])
+    st.session_state.messages.append(assistant_message)
+    try:
+        save_message(
+            st.session_state.get("db_session_id"),
+            "assistant",
+            response,
+            tts_language=language_code,
+            media=relevant_media,
         )
-
+    except Exception as e:
+        print("SQL ASSISTANT MESSAGE SAVE ERROR:", repr(e))
+    with st.spinner("🔊 Generating voice..."):
+        audio_file=text_to_speech(text=response,language_code=language_code)
     if audio_file:
-
-        st.session_state.messages[
-            -1
-        ]["audio_file"] = (
-            audio_file
-        )
-
+        st.session_state.messages[-1]["audio_file"]=audio_file
     else:
+        st.warning("⚠️ Text response generated, but voice generation failed. Check the terminal for TTS ERROR.")
 
-        st.warning(
-
-            "⚠️ Text response generated, "
-            "but voice generation failed. "
-            "Check the terminal for TTS ERROR."
-        )
 
 
 # ============================================================
@@ -6064,18 +4453,13 @@ def process_user_message(
 
 def render_messages():
 
-    if not st.session_state.messages:
-
-        st.info(
-            "👋 Ask me something or upload a source."
-        )
-
-        return
-
-    for message in st.session_state.messages:
+    for message in (
+        st.session_state.messages
+    ):
 
         role = message.get(
-            "role"
+            "role",
+            "assistant"
         )
 
         content = message.get(
@@ -6083,119 +4467,201 @@ def render_messages():
             ""
         )
 
-        if role == "user":
+        with st.chat_message(
+            role
+        ):
 
-            with st.chat_message(
-                "user"
-            ):
+            st.markdown(
+                content
+            )
 
-                st.markdown(
-                    content
+            # ------------------------------------------------
+            # SOURCE MEDIA
+            # ------------------------------------------------
+
+            source_media = message.get(
+                "source_media",
+                []
+            )
+
+            for media in source_media:
+
+                image_data = media.get(
+                    "data"
                 )
 
-        else:
+                if not image_data:
 
-            with st.chat_message(
-                "assistant"
-            ):
+                    continue
 
-                st.markdown(
-                    content
+                caption = media.get(
+                    "caption",
+                    "Relevant source"
                 )
 
-                source_media = message.get(
-                    "source_media",
-                    []
+                timestamp = media.get(
+                    "timestamp"
                 )
 
-                for media in source_media:
+                if timestamp is not None:
 
-                    if media.get(
-                        "type"
-                    ) == "image":
+                    st.image(
 
-                        image_data = media.get(
-                            "data"
+                        image_data,
+
+                        caption=(
+                            f"{caption} — "
+                            f"{format_timestamp(timestamp)}"
+                        ),
+
+                        use_container_width=True,
+                    )
+
+                    video_text = media.get(
+                        "video_text"
+                    )
+
+                    if video_text:
+
+                        st.caption(
+                            f"📝 Transcript: "
+                            f"{video_text}"
                         )
 
-                        if image_data:
+                else:
 
-                            st.image(
+                    st.image(
 
-                                image_data,
+                        image_data,
 
-                                caption=media.get(
-                                    "caption",
-                                    "Source visual"
-                                ),
+                        caption=caption,
 
-                                use_container_width=True
-                            )
+                        use_container_width=True,
+                    )
 
-                        if media.get(
-                            "timestamp"
-                        ) is not None:
+            # ------------------------------------------------
+            # AUDIO
+            # ------------------------------------------------
 
-                            st.caption(
+            audio_file = message.get(
+                "audio_file"
+            )
 
-                                "⏱️ Timestamp: "
-                                +
-                                format_timestamp(
-                                    media[
-                                        "timestamp"
-                                    ]
-                                )
-                            )
+            if (
 
-                        if media.get(
-                            "video_text"
-                        ):
+                role == "assistant"
 
-                            st.caption(
+                and audio_file
 
-                                "🎬 Transcript: "
-                                +
-                                media[
-                                    "video_text"
-                                ]
-                            )
-
-                    elif media.get(
-                        "type"
-                    ) == "website_login_required":
-
-                        st.warning(
-                            "🔐 Website login is required."
-                        )
-
-                audio_file = message.get(
-                    "audio_file"
+                and os.path.exists(
+                    audio_file
                 )
 
-                if audio_file:
+            ):
 
-                    if os.path.exists(
-                        audio_file
-                    ):
+                try:
 
-                        try:
+                    with open(
+                        audio_file,
+                        "rb"
+                    ) as audio:
 
-                            with open(
-                                audio_file,
-                                "rb"
-                            ) as audio:
+                        audio_bytes = (
+                            audio.read()
+                        )
 
-                                st.audio(
-                                    audio.read(),
-                                    format="audio/mp3"
-                                )
+                    st.audio(
 
-                        except Exception as e:
+                        audio_bytes,
 
-                            print(
-                                "Audio render error:",
-                                repr(e)
-                            )
+                        format="audio/mp3",
+
+                        autoplay=True,
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "Audio rendering error:",
+                        repr(e)
+                    )
+
+
+# ============================================================
+# PERSISTENT CHAT HISTORY
+# ============================================================
+
+def _history_title(session):
+    title = (session.get("title") or "New Chat").strip()
+    if title == "New Chat":
+        return "New Chat"
+    return title[:42] + ("…" if len(title) > 42 else "")
+
+
+def load_saved_chat(session_id):
+    if not session_id:
+        return
+    try:
+        st.session_state.db_session_id = session_id
+        st.session_state.messages = load_messages(session_id)
+        st.session_state.db_loaded = True
+        clear_source()
+        st.session_state.pending_transcript = ""
+        st.session_state.voice_ready = False
+        st.session_state.recorder_key += 1
+        print("SQL DATABASE: history opened", session_id)
+    except Exception as e:
+        print("SQL HISTORY LOAD ERROR:", repr(e))
+        st.error("Could not load this chat history.")
+
+
+def maybe_update_chat_title(user_message):
+    session_id = st.session_state.get("db_session_id")
+    if not session_id:
+        return
+    # Use the first user message as a ChatGPT-style title.
+    user_messages = [
+        m.get("content", "").strip()
+        for m in st.session_state.get("messages", [])
+        if m.get("role") == "user" and m.get("content", "").strip()
+    ]
+    if len(user_messages) != 1:
+        return
+    title = user_messages[0].replace("\n", " ").strip()
+    if len(title) > 48:
+        title = title[:48].rstrip() + "…"
+    try:
+        touch_session(session_id, title or "New Chat")
+    except Exception as e:
+        print("SQL TITLE UPDATE ERROR:", repr(e))
+
+
+def render_chat_history():
+    try:
+        sessions = list_sessions(limit=100)
+    except Exception as e:
+        print("SQL HISTORY LIST ERROR:", repr(e))
+        st.caption("Chat history is temporarily unavailable.")
+        return
+
+    if not sessions:
+        st.caption("No previous chats yet.")
+        return
+
+    current_id = st.session_state.get("db_session_id")
+    for session in sessions:
+        sid = session.get("id")
+        title = _history_title(session)
+        is_current = sid == current_id
+        label = ("🟢 " if is_current else "💬 ") + title
+        if st.button(
+            label,
+            key=f"history_{sid}",
+            use_container_width=True,
+            help=f"Open chat from {session.get('updated_at', '')}",
+        ):
+            load_saved_chat(sid)
+            st.rerun()
 
 
 # ============================================================
@@ -6204,100 +4670,212 @@ def render_messages():
 
 def render_sidebar():
 
-    ensure_active_session()
-
     with st.sidebar:
 
-        st.title("🎙️ AI Voice Assistant")
+        st.title(
+            "🎙️ AI Voice Assistant"
+        )
 
         st.caption(
-            "Multilingual AI assistant with document, video, "
-            "website understanding and SQL chat history."
+            "Multilingual AI voice assistant"
         )
 
         st.divider()
 
-        if st.button("🆕 New Chat", use_container_width=True):
+        # ----------------------------------------------------
+        # NEW CHAT
+        # ----------------------------------------------------
+
+        if st.button(
+
+            "🆕 New Chat",
+
+            use_container_width=True
+
+        ):
+
             start_new_chat()
+
             st.rerun()
 
-        st.divider()
-        st.subheader("📚 Chat History")
+        # ----------------------------------------------------
+        # CHAT HISTORY
+        # ----------------------------------------------------
 
-        sessions = db_list_sessions(limit=50)
+        st.subheader("💬 Chat History")
+        render_chat_history()
 
-        if not sessions:
-            st.caption("No saved chats yet.")
-        else:
-            for item in sessions:
-                session_id = item["id"]
-                title = item.get("title") or "New Chat"
-                label = title[:42] + ("…" if len(title) > 42 else "")
+        # ----------------------------------------------------
+        # CLEAR SOURCE
+        # ----------------------------------------------------
 
-                c1, c2 = st.columns([5, 1])
-                with c1:
-                    if st.button(
-                        ("🟢 " if session_id == st.session_state.active_session_id else "💬 ") + label,
-                        key=f"open_chat_{session_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.active_session_id = session_id
-                        st.session_state.messages = db_load_messages(session_id)
-                        st.session_state.messages_loaded = True
-                        clear_source()
-                        st.rerun()
-                with c2:
-                    if st.button("🗑️", key=f"delete_chat_{session_id}"):
-                        db_delete_session(session_id)
-                        if session_id == st.session_state.active_session_id:
-                            remaining = db_list_sessions(limit=1)
-                            if remaining:
-                                st.session_state.active_session_id = remaining[0]["id"]
-                                st.session_state.messages = db_load_messages(remaining[0]["id"])
-                            else:
-                                new_id = db_create_session("New Chat")
-                                st.session_state.active_session_id = new_id
-                                st.session_state.messages = []
-                            st.session_state.messages_loaded = True
-                        st.rerun()
+        if st.button(
 
-        st.divider()
+            "🧹 Clear Uploaded Source",
 
-        if st.button("🧹 Delete All Chat History", use_container_width=True):
-            db_clear_all_history()
-            new_id = db_create_session("New Chat")
-            st.session_state.active_session_id = new_id
-            st.session_state.messages = []
-            st.session_state.messages_loaded = True
-            st.rerun()
+            use_container_width=True
 
-        if st.button("🗑️ Clear Uploaded Source", use_container_width=True):
+        ):
+
             clear_source()
+
             st.rerun()
 
         st.divider()
-        st.subheader("📌 Current Source")
 
-        source = st.session_state.source_data
+        # ----------------------------------------------------
+        # SEARCH
+        # ----------------------------------------------------
+
+        st.subheader(
+            "🔎 Search Chat"
+        )
+
+        search_text = st.text_input(
+
+            "Search messages",
+
+            placeholder="Type to search..."
+        )
+
+        if search_text:
+
+            search_lower = (
+                search_text.lower()
+            )
+
+            found = False
+
+            for message in (
+                st.session_state.messages
+            ):
+
+                content = message.get(
+                    "content",
+                    ""
+                )
+
+                if search_lower in (
+                    content.lower()
+                ):
+
+                    found = True
+
+                    st.write(
+                        content[:300]
+                    )
+
+            if not found:
+
+                st.caption(
+                    "No matching message found."
+                )
+
+        st.divider()
+
+        # ----------------------------------------------------
+        # SOURCE STATUS
+        # ----------------------------------------------------
+
+        st.subheader(
+            "📚 Current Source"
+        )
+
+        source = (
+            st.session_state.source_data
+        )
+
         if source:
-            source_type = source.get("source_type", "unknown")
-            filename = source.get("filename", "")
-            st.success(f"📎 {source_type.upper()}")
-            st.caption(filename)
+
+            st.success(
+
+                f"✅ "
+                f"{source.get('filename', 'Source')}"
+            )
+
+            st.caption(
+
+                f"Type: "
+                f"{source.get('source_type')}"
+            )
+
         else:
-            st.caption("No source uploaded.")
+
+            st.caption(
+                "No source uploaded."
+            )
 
         st.divider()
-        st.subheader("🌍 Supported Languages")
-        st.write(", ".join(LANGUAGE_NAMES.values()))
+
+        # ----------------------------------------------------
+        # LANGUAGES
+        # ----------------------------------------------------
+
+        st.subheader(
+            "🌍 Supported Languages"
+        )
+
+        st.caption(
+
+            f"{len(LANGUAGE_NAMES)} "
+            "languages supported"
+        )
+
+        with st.expander(
+            "View languages"
+        ):
+
+            for code, name in (
+                LANGUAGE_NAMES.items()
+            ):
+
+                st.write(
+                    f"• {code.upper()} — {name}"
+                )
 
         st.divider()
-        st.subheader("⚙️ System Status")
-        st.write("Whisper:", "✅" if WHISPER_MODEL_NAME else "❌")
-        st.write("Gemini:", "✅" if GEMINI_API_KEY else "❌")
-        st.write("Playwright:", "✅" if PLAYWRIGHT_AVAILABLE else "❌")
-        st.write("FFmpeg:", "✅" if check_ffmpeg() else "❌")
-        st.write("SQL Database:", "✅")
+
+        # ----------------------------------------------------
+        # CLEAR HISTORY
+        # ----------------------------------------------------
+
+        if st.button(
+
+            "🗑️ Clear Chat History",
+
+            use_container_width=True
+
+        ):
+
+            st.session_state.messages = []
+            try:
+                clear_session_messages(st.session_state.get("db_session_id"))
+            except Exception as e:
+                print("SQL CLEAR HISTORY ERROR:", repr(e))
+
+            st.rerun()
+
+        st.divider()
+
+        st.caption(
+            f"Whisper: "
+            f"{WHISPER_MODEL_NAME}"
+        )
+
+        st.caption(
+            f"Gemini: "
+            f"{GEMINI_MODEL}"
+        )
+
+        st.caption(
+            f"Playwright: "
+            f"{'Available' if PLAYWRIGHT_AVAILABLE else 'Not available'}"
+        )
+
+        st.caption(
+            f"FFmpeg: "
+            f"{'Available' if check_ffmpeg() else 'Not available'}"
+        )
 
 
 # ============================================================
@@ -6306,520 +4884,217 @@ def render_sidebar():
 
 def main():
 
+    init_sql_session()
+
     render_sidebar()
 
     st.title(
         "🎙️ Multilingual AI Voice Assistant"
     )
 
-    st.caption(
-
-        "Ask questions by voice or text. "
-        "Upload documents/videos/images or analyze "
-        "a website and get source-grounded answers."
+    st.markdown(
+        "Speak naturally in your language "
+        "and get text + voice AI responses."
     )
 
+    st.divider()
+
     # ========================================================
-    # WEBSITE ANALYSIS
+    # WEBSITE URL + PUBLIC / LOGIN-PROTECTED SUPPORT
     # ========================================================
 
-    st.header(
-        "🌐 Website Analysis"
-    )
+    st.subheader("🌐 Website Analysis")
 
     website_url = st.text_input(
-
         "Enter website URL",
-
-        value=st.session_state.get(
-            "website_url_input",
-            ""
-        ),
-
-        placeholder=(
-            "https://example.com"
-        )
+        placeholder="https://example.com",
+        key="website_url_input",
     )
 
-    st.session_state[
-        "website_url_input"
-    ] = website_url
-
-    if st.button(
-        "🔍 Analyze Website",
-        use_container_width=False
-    ):
-
+    if st.button("🔍 Analyze Website", use_container_width=True):
         if not website_url.strip():
-
-            st.warning(
-                "Please enter a website URL."
-            )
-
+            st.warning("Please enter a website URL.")
         else:
-
-            with st.spinner(
-                "🌐 Inspecting website..."
-            ):
-
-                inspection = (
-                    inspect_website_access(
-                        website_url
-                    )
-                )
-
-            if inspection.get(
-                "requires_login"
-            ):
-
-                st.session_state[
-                    "website_login_required"
-                ] = True
-
-                st.session_state[
-                    "website_login_url"
-                ] = (
-
-                    inspection.get(
-                        "login_url"
-                    )
-
-                    or
-
-                    website_url
-                )
-
-                st.session_state[
-                    "website_original_url"
-                ] = website_url
-
-                st.warning(
-                    "🔐 This website requires login."
-                )
-
-            else:
-
-                with st.spinner(
-                    "🌐 Crawling website..."
-                ):
-
-                    try:
-
-                        website_data = (
-                            fetch_website(
-                                website_url
-                            )
-                        )
-
-                        st.session_state[
-                            "source_data"
-                        ] = {
-
-                            "source_type":
-                            "website",
-
-                            "filename":
-                            normalize_url(
-                                website_url
-                            ),
-
-                            "extension":
-                            "",
-
-                            "file_hash":
-                            hashlib.sha256(
-                                website_url.encode()
-                            ).hexdigest(),
-
-                            "file_bytes":
-                            b"",
-
-                            "uploaded_context":
-                            website_data.get(
-                                "text",
-                                ""
-                            ),
-
-                            "image_part":
-                            None,
-
-                            "file_part":
-                            None,
-
-                            "pdf_pages":
-                            [],
-
-                            "render_pdf_bytes":
-                            None,
-
-                            "video_path":
-                            None,
-
-                            "video_segments":
-                            [],
-
-                            "video_language":
-                            "en",
-
-                            "website_data":
-                            website_data,
-
-                            "storage_state":
-                            None,
-
-                            "authenticated":
-                            False,
-                        }
-
-                        st.session_state[
-                            "source_filename"
-                        ] = website_url
-
-                        db_save_source(
-                            ensure_active_session(),
-                            st.session_state["source_data"]
-                        )
-
-                        st.session_state[
-                            "website_authenticated"
-                        ] = False
-
-                        st.success(
-                            "✅ Website analyzed successfully."
-                        )
-
-                        st.info(
-
-                            f"Found "
-                            f"{len(website_data.get('pages', []))} "
-                            f"accessible pages."
-                        )
-
-                    except Exception as e:
-
-                        st.error(
-                            "❌ Website analysis failed."
-                        )
-
-                        st.exception(e)
-
-    # ========================================================
-    # WEBSITE LOGIN
-    # ========================================================
-
-    if st.session_state.get(
-        "website_login_required"
-    ):
-
-        st.subheader(
-            "🔐 Website Login"
-        )
-
-        login_url = st.session_state.get(
-            "website_login_url",
-            website_url
-        )
-
-        st.caption(
-            f"Login page: {login_url}"
-        )
-
-        login_id = st.text_input(
-
-            "Login ID / Email / Username",
-
-            key="website_login_id"
-        )
-
-        login_password = st.text_input(
-
-            "Password",
-
-            type="password",
-
-            key="website_login_password"
-        )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            if st.button(
-                "🔓 Login & Analyze",
-                use_container_width=True
-            ):
-
-                with st.spinner(
-                    "🔐 Logging in..."
-                ):
-
-                    login_result = (
-                        login_to_website(
-
-                            login_url,
-
-                            login_id,
-
-                            login_password
-                        )
-                    )
-
-                if login_result.get(
-                    "success"
-                ):
-
-                    st.success(
-                        "✅ Login successful."
-                    )
-
-                    original_url = (
-                        st.session_state.get(
-                            "website_original_url",
-                            website_url
-                        )
-                    )
-
-                    with st.spinner(
-                        "🌐 Crawling authenticated website..."
-                    ):
-
-                        try:
-
-                            website_data = (
-                                crawl_authenticated_website(
-
-                                    original_url,
-
-                                    login_result[
-                                        "storage_state"
-                                    ],
-
-                                    max_pages=MAX_WEBSITE_PAGES
-                                )
-                            )
-
-                            storage_state = (
-                                website_data.get(
-                                    "storage_state"
-                                )
-                            )
-
-                            st.session_state[
-                                "source_data"
-                            ] = {
-
-                                "source_type":
-                                "website",
-
-                                "filename":
-                                original_url,
-
-                                "extension":
-                                "",
-
-                                "file_hash":
-                                hashlib.sha256(
-                                    original_url.encode()
-                                ).hexdigest(),
-
-                                "file_bytes":
-                                b"",
-
-                                "uploaded_context":
-                                website_data.get(
-                                    "text",
-                                    ""
-                                ),
-
-                                "image_part":
-                                None,
-
-                                "file_part":
-                                None,
-
-                                "pdf_pages":
-                                [],
-
-                                "render_pdf_bytes":
-                                None,
-
-                                "video_path":
-                                None,
-
-                                "video_segments":
-                                [],
-
-                                "video_language":
-                                "en",
-
-                                "website_data":
-                                website_data,
-
-                                "storage_state":
-                                storage_state,
-
-                                "authenticated":
-                                True,
-                            }
-
-                            st.session_state[
-                                "source_filename"
-                            ] = original_url
-
-                            db_save_source(
-                                ensure_active_session(),
-                                st.session_state["source_data"]
-                            )
-
-                            st.session_state[
-                                "website_authenticated"
-                            ] = True
-
-                            st.session_state[
-                                "website_login_required"
-                            ] = False
-
-                            st.success(
-                                "✅ Authenticated website analyzed."
-                            )
-
-                            # Do not automatically submit
-                            # credentials anywhere else.
-
-                        except Exception as e:
-
-                            st.error(
-                                "❌ Authenticated crawl failed."
-                            )
-
-                            st.exception(e)
-
+            website_url = normalize_url(website_url)
+            try:
+                with st.spinner("🌐 Checking website access..."):
+                    inspection = inspect_website_access(website_url)
+
+                if not inspection.get("success"):
+                    st.error(f"❌ Website access check failed: {inspection.get('error','Unknown error')}")
+                elif inspection.get("requires_login"):
+                    st.session_state.website_login_required = True
+                    st.session_state.website_login_url = inspection.get("login_url") or website_url
+                    st.session_state.website_original_url = website_url
+                    st.warning("🔐 This website requires login. Enter your credentials below.")
                 else:
+                    with st.spinner("🌐 Crawling public website pages..."):
+                        website_data = fetch_website(website_url)
+                    st.session_state.source_data = {
+                        "source_type": "website",
+                        "filename": website_url,
+                        "extension": "",
+                        "file_hash": "",
+                        "file_bytes": b"",
+                        "uploaded_context": website_data.get("text", ""),
+                        "image_part": None,
+                        "file_part": None,
+                        "website_url": website_url,
+                        "website_title": website_data.get("title", ""),
+                        "website_data": website_data,
+                        "website_authenticated": False,
+                    }
+                    st.session_state.source_filename = website_url
+                    st.session_state.website_authenticated = False
+                    st.session_state.website_login_required = False
+                    st.success(f"✅ Website analyzed successfully. {len(website_data.get('pages', []))} same-domain pages scanned.")
+                    if website_data.get("title"):
+                        st.info(f"📌 {website_data['title']}")
+            except Exception as e:
+                st.error(f"❌ Website analysis failed: {e}")
 
-                    if login_result.get(
-                        "security_challenge"
-                    ):
+    # --------------------------------------------------------
+    # LOGIN FORM
+    # --------------------------------------------------------
+    if st.session_state.get("website_login_required", False):
+        st.markdown("---")
+        st.warning("🔐 Login is required to access this website/page.")
+        login_url = st.session_state.get("website_login_url", "")
+        if login_url:
+            st.caption(f"Login page: {login_url}")
 
-                        st.warning(
+        with st.form("website_login_form"):
+            login_id = st.text_input("Login ID / Email / Username", placeholder="Enter login ID")
+            login_password = st.text_input("Password", type="password", placeholder="Enter password")
+            login_submit = st.form_submit_button("🔐 Login & Analyze Website", use_container_width=True)
 
-                            "⚠️ This website requires "
-                            "CAPTCHA/OTP/2FA/passkey verification. "
-                            "Automatic login cannot bypass "
-                            "security verification."
-                        )
+        if login_submit:
+            if not login_id.strip():
+                st.error("Please enter Login ID / Email / Username.")
+            elif not login_password:
+                st.error("Please enter your password.")
+            else:
+                with st.spinner("🔐 Logging in..."):
+                    login_result = login_to_website(login_url, login_id, login_password)
+                if login_result.get("manual_required"):
+                    st.warning(login_result.get("message", "Manual verification is required."))
+                elif not login_result.get("success"):
+                    st.error(login_result.get("message", "Login failed."))
+                else:
+                    state = login_result.get("storage_state")
+                    original_url = st.session_state.get("website_original_url") or st.session_state.get("website_url_input")
+                    try:
+                        with st.spinner("✅ Login successful. Crawling authenticated pages..."):
+                            website_data = crawl_authenticated_website(original_url, state, max_pages=25)
+                        website_data["storage_state"] = state
+                        st.session_state.source_data = {
+                            "source_type": "website",
+                            "filename": original_url,
+                            "extension": "",
+                            "file_hash": "",
+                            "file_bytes": b"",
+                            "uploaded_context": website_data.get("text", ""),
+                            "image_part": None,
+                            "file_part": None,
+                            "website_url": original_url,
+                            "website_title": website_data.get("title", ""),
+                            "website_data": website_data,
+                            "website_authenticated": True,
+                            "storage_state": state,
+                        }
+                        st.session_state.source_filename = original_url
+                        st.session_state.website_authenticated = True
+                        st.session_state.website_login_required = False
+                        st.session_state.website_login_url = ""
+                        # Password is intentionally NOT stored.
+                        st.success(f"✅ Login successful. {len(website_data.get('pages', []))} authenticated pages scanned.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Authenticated website analysis failed: {e}")
 
-                    else:
-
-                        st.error(
-
-                            login_result.get(
-                                "error",
-                                "Login failed."
-                            )
-                        )
-
-        with col2:
-
-            if st.button(
-                "❌ Cancel Login",
-                use_container_width=True
-            ):
-
-                st.session_state[
-                    "website_login_required"
-                ] = False
-
-                st.session_state[
-                    "pending_website_question"
-                ] = ""
-
-                st.rerun()
-
-    # ========================================================
+    # --------------------------------------------------------
     # AUTHENTICATED STATUS
-    # ========================================================
-
-    if st.session_state.get(
-        "website_authenticated"
-    ):
-
-        st.success(
-            "🔓 Authenticated website source is active."
-        )
-
-        if st.button(
-            "🚪 Logout Website"
-        ):
-
+    # --------------------------------------------------------
+    if st.session_state.get("website_authenticated", False):
+        st.success("🔐 Logged-in website session is active for this Streamlit session.")
+        if st.button("🚪 Logout / Clear Website Session", use_container_width=True):
             clear_source()
-
             st.rerun()
 
+    # --------------------------------------------------------
+    # SHOW WEBSITE STATUS
+    # --------------------------------------------------------
+    current_source = st.session_state.source_data
+    if current_source and current_source.get("source_type") == "website":
+        with st.expander("🌐 View analyzed website content"):
+            website_data = current_source.get("website_data", {})
+            website_text = website_data.get("text", current_source.get("uploaded_context", ""))
+            if len(website_text) > 8000:
+                website_text = website_text[:8000] + "\n\n...[truncated]"
+            st.text_area("Website content", website_text, height=250, disabled=True)
+            st.caption(f"Pages scanned: {len(website_data.get('pages', []))}")
+
+    st.divider()
+
     # ========================================================
-    # WEBSITE CONTENT
+    # CAMERA CAPTURE
     # ========================================================
 
-    source = (
-        st.session_state.source_data
+    st.subheader("📷 Camera")
+    camera_photo = st.camera_input(
+        "Take a photo",
+        key="camera_capture",
     )
 
-    if (
-        source
-        and
-        source.get(
-            "source_type"
-        )
-        ==
-        "website"
-    ):
-
-        website_data = source.get(
-            "website_data",
-            {}
+    if camera_photo is not None:
+        camera_bytes = camera_photo.getvalue()
+        camera_hash = get_file_hash(camera_bytes)
+        current_hash = (
+            st.session_state.source_data.get("file_hash")
+            if st.session_state.get("source_data")
+            else None
         )
 
-        with st.expander(
-            "🌐 Analyzed Website Content",
-            expanded=False
-        ):
-
-            st.write(
-                "Pages:",
-                len(
-                    website_data.get(
-                        "pages",
-                        []
-                    )
+        if camera_hash != current_hash:
+            try:
+                camera_source = {
+                    "source_type": "image",
+                    "filename": f"camera_{camera_hash[:12]}.jpg",
+                    "extension": ".jpg",
+                    "file_hash": camera_hash,
+                    "file_bytes": camera_bytes,
+                    "uploaded_context": "",
+                    "image_part": types.Part.from_bytes(
+                        data=camera_bytes,
+                        mime_type="image/jpeg",
+                    ),
+                    "file_part": None,
+                    "camera_capture": True,
+                }
+                st.session_state.source_data = camera_source
+                st.session_state.source_filename = camera_source["filename"]
+                save_source(
+                    st.session_state.get("db_session_id"),
+                    camera_source,
                 )
-            )
+                st.success("📷 Camera photo is ready. Ask a question about it.")
+            except Exception as e:
+                print("CAMERA PROCESS ERROR:", repr(e))
+                st.error(f"❌ Camera image processing failed: {e}")
 
-            for page in website_data.get(
-                "pages",
-                []
-            )[:20]:
-
-                st.markdown(
-                    f"**{page.get('title', '')}**"
-                )
-
-                st.caption(
-                    page.get(
-                        "url",
-                        ""
-                    )
-                )
+        st.image(
+            camera_bytes,
+            caption="📷 Camera photo",
+            use_container_width=True,
+        )
 
     # ========================================================
     # FILE UPLOAD
     # ========================================================
 
-    st.header(
-        "📎 Upload Source"
-    )
-
     uploaded_file = st.file_uploader(
 
-        "Upload PDF, DOCX, PPTX, TXT, CSV, image or video",
+        "📎 Upload document, image or video",
 
         type=[
 
@@ -6842,68 +5117,209 @@ def main():
             "m4v",
             "avi",
             "mkv",
-        ]
+        ],
     )
 
-    if uploaded_file:
+    if uploaded_file is not None:
 
-        uploaded_hash = get_file_hash(
+        file_hash = get_file_hash(
             uploaded_file.getvalue()
         )
 
-        existing_hash = None
+        current_hash = None
 
         if st.session_state.source_data:
 
-            existing_hash = (
+            current_hash = (
                 st.session_state.source_data.get(
                     "file_hash"
                 )
             )
 
-        if uploaded_hash != existing_hash:
+        if file_hash != current_hash:
 
             try:
 
                 with st.spinner(
-                    "📚 Processing uploaded source..."
+                    "📄 Processing uploaded source..."
                 ):
 
-                    processed = (
+                    source_data = (
                         process_uploaded_file(
                             uploaded_file
                         )
                     )
 
-                st.session_state[
-                    "source_data"
-                ] = processed
+                    st.session_state.source_data = (
+                        source_data
+                    )
 
-                st.session_state[
-                    "source_filename"
-                ] = uploaded_file.name
+                    st.session_state.source_filename = (
+                        uploaded_file.name
+                    )
 
-                db_save_source(
-                    ensure_active_session(),
-                    processed
-                )
+                    try:
+                        source_data["filename"] = uploaded_file.name
+                        save_source(
+                            st.session_state.get("db_session_id"),
+                            source_data,
+                        )
+                    except Exception as e:
+                        print("SQL SOURCE SAVE ERROR:", repr(e))
 
                 st.success(
-
-                    f"✅ {uploaded_file.name} "
-                    f"processed successfully."
+                    f"✅ "
+                    f"{uploaded_file.name} processed."
                 )
 
             except Exception as e:
 
                 st.error(
-                    "❌ File processing failed."
+                    f"❌ File processing failed: {e}"
                 )
 
-                st.exception(e)
+        source = (
+            st.session_state.source_data
+        )
+
+        extension = Path(
+            uploaded_file.name
+        ).suffix.lower()
+
+        # ----------------------------------------------------
+        # IMAGE PREVIEW
+        # ----------------------------------------------------
+
+        if extension in {
+
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+            ".gif",
+
+        }:
+
+            st.image(
+
+                uploaded_file,
+
+                caption=uploaded_file.name,
+
+                use_container_width=True,
+            )
+
+            st.success(
+                "🖼️ Image ready. "
+                "Ask a question about the uploaded image."
+            )
+
+        # ----------------------------------------------------
+        # VIDEO
+        # ----------------------------------------------------
+
+        if extension in {
+
+            ".mp4",
+            ".mov",
+            ".m4v",
+            ".avi",
+            ".mkv",
+
+        }:
+
+            try:
+
+                st.video(
+                    uploaded_file
+                )
+
+            except Exception:
+                pass
+
+            if source:
+
+                video_segments = (
+                    source.get(
+                        "video_segments",
+                        []
+                    )
+                )
+
+                transcript = (
+                    source.get(
+                        "uploaded_context",
+                        ""
+                    )
+                )
+
+                st.success(
+                    "🎬 Video transcription completed."
+                )
+
+                st.caption(
+
+                    f"Detected language: "
+                    f"{LANGUAGE_NAMES.get(source.get('video_language', 'en'), 'English')}"
+                )
+
+                with st.expander(
+                    "🎬 View video transcript with timestamps"
+                ):
+
+                    st.text_area(
+
+                        "Transcript",
+
+                        transcript,
+
+                        height=300,
+
+                        disabled=True,
+                    )
+
+        # ----------------------------------------------------
+        # EXTRACTED TEXT
+        # ----------------------------------------------------
+
+        if source:
+
+            extracted_context = (
+                source.get(
+                    "uploaded_context",
+                    ""
+                )
+            )
+
+            if extracted_context:
+
+                with st.expander(
+                    "📄 View extracted source text"
+                ):
+
+                    preview = extracted_context
+
+                    if len(preview) > 6000:
+
+                        preview = (
+                            preview[:6000]
+                            +
+                            "\n\n...[truncated]"
+                        )
+
+                    st.text_area(
+
+                        "Extracted content",
+
+                        preview,
+
+                        height=250,
+
+                        disabled=True,
+                    )
 
     # ========================================================
-    # DISPLAY CURRENT SOURCE
+    # CURRENT SOURCE STATUS
     # ========================================================
 
     source = (
@@ -6916,120 +5332,60 @@ def main():
             "source_type"
         )
 
-        st.subheader(
-            "📌 Current Source"
-        )
-
-        st.write(
-            f"**Type:** {source_type}"
-        )
-
-        st.write(
-            f"**Name:** "
-            f"{source.get('filename', '')}"
-        )
-
-        # ----------------------------------------------------
-        # IMAGE
-        # ----------------------------------------------------
-
-        if source_type == "image":
-
-            image_data = source.get(
-                "file_bytes"
-            )
-
-            if image_data:
-
-                st.image(
-
-                    image_data,
-
-                    caption="🖼️ Uploaded image",
-
-                    use_container_width=True
-                )
-
-        # ----------------------------------------------------
-        # VIDEO
-        # ----------------------------------------------------
-
         if source_type == "video":
 
-            video_path = source.get(
-                "video_path"
+            st.info(
+
+                "🎬 Video source ready. "
+                "Ask a question about any part of the video. "
+                "The relevant frame and timestamp will be shown."
             )
 
-            if (
-                video_path
-                and
-                os.path.exists(video_path)
-            ):
+        elif source_type == "pdf":
 
-                try:
+            st.info(
 
-                    with open(
-                        video_path,
-                        "rb"
-                    ) as video:
-
-                        st.video(
-                            video.read()
-                        )
-
-                except Exception as e:
-
-                    print(
-                        "Video preview error:",
-                        repr(e)
-                    )
-
-            st.caption(
-
-                "Detected language: "
-                +
-                LANGUAGE_NAMES.get(
-
-                    source.get(
-                        "video_language",
-                        "en"
-                    ),
-
-                    "English"
-                )
+                "📄 PDF source ready. "
+                "Ask about a section and the relevant page "
+                "screenshot will be shown with the answer."
             )
 
-            with st.expander(
-                "🎬 Video Transcript"
-            ):
+        elif source_type in {
+            "docx",
+            "pptx"
+        }:
 
-                st.text(
-                    source.get(
-                        "uploaded_context",
-                        ""
-                    )
-                )
+            st.info(
 
-        # ----------------------------------------------------
-        # EXTRACTED TEXT
-        # ----------------------------------------------------
+                "📄 Office document ready. "
+                "Relevant page/slide screenshot will be shown "
+                "when available."
+            )
 
-        uploaded_context = source.get(
-            "uploaded_context",
-            ""
-        )
+        elif source_type == "website":
 
-        if uploaded_context:
+            st.info(
 
-            with st.expander(
-                "📄 Extracted Source Text"
-            ):
+                "🌐 Website ready. "
+                "Ask about a section and the relevant "
+                "website screenshot will be shown."
+            )
 
-                st.text(
-                    uploaded_context[
-                        :20000
-                    ]
-                )
+        elif source_type == "image":
+
+            st.info(
+
+                "🖼️ Image source ready. "
+                "Ask anything about the uploaded image."
+            )
+
+        elif source_type == "text":
+
+            st.info(
+
+                "📄 Text source ready. "
+                "Ask a question about the uploaded content."
+            )
 
     # ========================================================
     # CHAT HISTORY
@@ -7041,175 +5397,274 @@ def main():
     # VOICE INPUT
     # ========================================================
 
-    st.header(
-        "🎙️ Voice Input"
+    st.subheader(
+        "🎤 Voice Input"
+    )
+
+    st.caption(
+        "Speak → Edit → Send to AI → "
+        "Text + Voice Answer"
+    )
+
+    recorder_key = (
+        f"recorder_"
+        f"{st.session_state.recorder_key}"
     )
 
     audio_value = st.audio_input(
 
-        "Record your question",
+        "Click microphone and speak",
 
-        key=(
-            f"voice_recorder_"
-            f"{st.session_state.recorder_key}"
-        )
+        sample_rate=16000,
+
+        key=recorder_key,
     )
 
-    if audio_value:
+    # ========================================================
+    # PROCESS NEW RECORDING
+    # ========================================================
 
-        if st.button(
-            "📝 Transcribe Voice",
-            use_container_width=False
-        ):
+    if audio_value is not None:
 
-            wav_path = None
-            input_path = None
+        if not st.session_state.voice_ready:
 
-            try:
+            st.audio(
+                audio_value,
+                format="audio/wav"
+            )
 
-                with st.spinner(
-                    "🎧 Transcribing..."
-                ):
+            if st.button(
 
-                    audio_bytes = (
-                        audio_value.getvalue()
-                    )
+                "🎧 Transcribe Voice",
+
+                use_container_width=True,
+
+                type="primary",
+            ):
+
+                input_path = None
+
+                converted_path = None
+
+                try:
 
                     input_path = os.path.join(
 
                         tempfile.gettempdir(),
 
-                        f"voice_"
-                        f"{uuid.uuid4().hex}.webm"
+                        f"recording_"
+                        f"{uuid.uuid4().hex}.wav"
                     )
 
                     with open(
+
                         input_path,
+
                         "wb"
+
                     ) as audio_file:
 
                         audio_file.write(
-                            audio_bytes
+                            audio_value.getvalue()
                         )
 
-                    wav_path = (
-                        convert_audio_to_wav(
-                            input_path
+                    with st.spinner(
+                        "🔄 Preparing audio..."
+                    ):
+
+                        converted_path = (
+                            convert_audio_to_wav(
+                                input_path
+                            )
                         )
+
+                    with st.spinner(
+
+                        f"⏳ Loading Whisper "
+                        f"{WHISPER_MODEL_NAME}..."
+
+                    ):
+
+                        whisper_model = (
+                            load_whisper()
+                        )
+
+                    with st.spinner(
+                        "🎧 Understanding your voice..."
+                    ):
+
+                        (
+                            language_code,
+                            transcript,
+                        ) = transcribe_audio(
+
+                            whisper_model,
+
+                            converted_path,
+                        )
+
+                    if not transcript:
+
+                        st.warning(
+
+                            "⚠️ No speech detected. "
+                            "Please record again."
+                        )
+
+                    else:
+
+                        st.session_state.pending_transcript = (
+                            transcript
+                        )
+
+                        st.session_state.pending_language = (
+                            language_code
+                        )
+
+                        st.session_state.voice_ready = (
+                            True
+                        )
+
+                        st.session_state.recorder_key += 1
+
+                        st.rerun()
+
+                except Exception as e:
+
+                    st.error(
+                        f"❌ Voice processing failed: {e}"
                     )
 
-                    model = load_whisper()
-
-                    (
-                        language,
-                        transcript,
-                        segments,
-                    ) = transcribe_audio(
-
-                        model,
-
-                        wav_path,
-
-                        return_segments=True
+                    print(
+                        "VOICE PROCESSING ERROR:",
+                        repr(e)
                     )
 
-                    st.session_state[
-                        "pending_transcript"
-                    ] = transcript
+                finally:
 
-                    st.session_state[
-                        "pending_language"
-                    ] = language
+                    for path in [
 
-                    st.session_state[
-                        "voice_ready"
-                    ] = True
+                        input_path,
+                        converted_path,
 
-                    st.success(
-                        "✅ Voice transcribed."
-                    )
+                    ]:
 
-            except Exception as e:
+                        if path:
 
-                st.error(
-                    "❌ Voice transcription failed."
-                )
+                            try:
 
-                st.exception(e)
+                                if os.path.exists(
+                                    path
+                                ):
 
-            finally:
+                                    os.remove(
+                                        path
+                                    )
 
-                if (
-                    wav_path
-                    and
-                    os.path.exists(wav_path)
-                ):
-
-                    try:
-                        os.remove(
-                            wav_path
-                        )
-                    except Exception:
-                        pass
-
-                if (
-                    input_path
-                    and
-                    os.path.exists(input_path)
-                ):
-
-                    try:
-                        os.remove(
-                            input_path
-                        )
-                    except Exception:
-                        pass
+                            except Exception:
+                                pass
 
     # ========================================================
-    # EDITED VOICE QUESTION
+    # EDITABLE VOICE QUESTION
     # ========================================================
 
-    if st.session_state.get(
-        "voice_ready"
-    ):
+    if st.session_state.voice_ready:
+
+        st.divider()
 
         st.subheader(
-            "📝 Voice Question"
+            "✏️ Edit Your Voice Question"
         )
 
-        final_question = st.text_area(
+        detected_language = (
+            st.session_state.pending_language
+        )
 
-            "You can edit the transcription before sending.",
+        detected_name = (
+            LANGUAGE_NAMES.get(
+                detected_language,
+                detected_language
+            )
+        )
 
-            value=st.session_state.get(
-                "pending_transcript",
-                ""
+        st.info(
+            f"🌍 Detected language: "
+            f"{detected_name}"
+        )
+
+        edited_question = st.text_area(
+
+            "Edit the transcription before sending to AI",
+
+            value=(
+                st.session_state.pending_transcript
             ),
 
-            height=100,
+            height=160,
 
-            key="editable_voice_question"
+            key="voice_question_editor",
+
+            help=(
+                "Correct transcription mistakes "
+                "before sending."
+            ),
         )
 
-        if st.button(
-            "🚀 Send Voice Question",
-            use_container_width=True
-        ):
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            send_voice_question = st.button(
+
+                "🚀 Send Edited Question to AI",
+
+                use_container_width=True,
+
+                type="primary",
+            )
+
+        with col2:
+
+            cancel_voice_question = st.button(
+
+                "❌ Cancel",
+
+                use_container_width=True,
+            )
+
+        if cancel_voice_question:
+
+            st.session_state.pending_transcript = ""
+
+            st.session_state.pending_language = "en"
+
+            st.session_state.voice_ready = False
+
+            if "voice_question_editor" in (
+                st.session_state
+            ):
+
+                del st.session_state[
+                    "voice_question_editor"
+                ]
+
+            st.session_state.recorder_key += 1
+
+            st.rerun()
+
+        if send_voice_question:
 
             final_question = (
-                final_question.strip()
+                edited_question.strip()
             )
 
             if not final_question:
 
                 st.warning(
-                    "Please enter a question."
+                    "⚠️ Please enter a question."
                 )
 
             else:
-
-                # IMPORTANT:
-                # Edited question decides language.
 
                 final_language = (
                     detect_text_language(
@@ -7217,77 +5672,76 @@ def main():
                     )
                 )
 
+                original_language = (
+                    st.session_state.pending_language
+                )
+
+                if (
+
+                    final_language == "en"
+
+                    and
+
+                    original_language != "en"
+
+                    and
+
+                    detect_script_language(
+                        final_question
+                    ) is None
+
+                ):
+
+                    final_language = (
+                        original_language
+                    )
+
                 if final_language not in LANGUAGE_NAMES:
 
                     final_language = "en"
 
                 process_user_message(
 
-                    user_message=final_question,
+                    user_message=
+                    final_question,
 
-                    language_code=final_language
+                    language_code=
+                    final_language,
                 )
 
-                st.session_state[
-                    "pending_transcript"
-                ] = ""
+                st.session_state.pending_transcript = ""
 
-                st.session_state[
-                    "voice_ready"
-                ] = False
+                st.session_state.pending_language = "en"
 
-                st.session_state[
-                    "recorder_key"
-                ] += 1
+                st.session_state.voice_ready = False
+
+                if "voice_question_editor" in (
+                    st.session_state
+                ):
+
+                    del st.session_state[
+                        "voice_question_editor"
+                    ]
+
+                st.session_state.recorder_key += 1
 
                 st.rerun()
 
     # ========================================================
-    # PENDING WEBSITE QUESTION
+    # PROCESS QUESTION THAT WAS WAITING FOR LOGIN
     # ========================================================
 
-    pending_website_question = (
-        st.session_state.get(
-            "pending_website_question",
-            ""
-        )
-    )
-
-    if (
-        pending_website_question
-        and
-        not st.session_state.get(
-            "website_login_required"
-        )
-    ):
-
-        st.info(
-            "🔄 Processing your previous website question..."
-        )
-
-        question = (
-            pending_website_question
-        )
-
-        st.session_state[
-            "pending_website_question"
-        ] = ""
-
-        language = detect_text_language(
-            question
-        )
-
+    pending_website_question = st.session_state.get("pending_website_question", "").strip()
+    if pending_website_question and st.session_state.get("website_authenticated", False):
+        st.session_state.pending_website_question = ""
         process_user_message(
-
-            question,
-
-            language
+            user_message=pending_website_question,
+            language_code=detect_text_language(pending_website_question),
         )
-
         st.rerun()
 
     # ========================================================
-    # TYPED CHAT
+    # TEXT CHAT
     # ========================================================
 
     user_text = st.chat_input(
@@ -7296,24 +5750,29 @@ def main():
 
     if user_text:
 
-        language_code = (
-            detect_text_language(
-                user_text
-            )
+        language_code = detect_text_language(
+            user_text
         )
 
         print("=" * 70)
         print("TYPED MESSAGE")
         print("=" * 70)
-        print("Text:", user_text)
-        print("Language:", language_code)
+
+        print(
+            f"Text     : {user_text}"
+        )
+
+        print(
+            f"Language : {language_code}"
+        )
+
         print("=" * 70)
 
         process_user_message(
 
             user_message=user_text,
 
-            language_code=language_code
+            language_code=language_code,
         )
 
         st.rerun()

@@ -1,299 +1,946 @@
 import os
 import json
+import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
-from sqlalchemy import create_engine, text
+_LOCK = threading.RLock()
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = BASE_DIR / "data" / "voice_assistant.db"
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+# ============================================================
+# DATABASE PATH
+# ============================================================
 
-if DATABASE_URL:
-    DB_URL = DATABASE_URL
-else:
-    data_dir = Path("data")
-    data_dir.mkdir(parents=True, exist_ok=True)
-    DB_URL = "sqlite:///" + str((data_dir / "voice_assistant.db").resolve()).replace("\\", "/")
+def _resolve_db_path():
+    value = (
+        os.getenv("DATABASE_URL")
+        or os.getenv("DB_URL")
+        or os.getenv("DB_PATH")
+        or ""
+    ).strip()
 
-engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
+    if not value:
+        return DEFAULT_DB_PATH
 
+    if value.startswith("sqlite:///"):
+        return Path(value[10:])
+
+    if value.startswith("sqlite://"):
+        return Path(value[9:])
+
+    # This project intentionally uses SQLite unless
+    # a separate database adapter is added.
+    # Ignore non-SQLite DATABASE_URL values.
+    if "://" in value:
+        return DEFAULT_DB_PATH
+
+    return Path(value)
+
+
+DB_PATH = _resolve_db_path()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def _connect():
+    conn = sqlite3.connect(
+        str(DB_PATH),
+        timeout=30,
+        check_same_thread=False,
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+
+    return conn
+
+
+# ============================================================
+# TIME
+# ============================================================
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _params(**kwargs):
-    return kwargs
+# ============================================================
+# SCHEMA HELPERS
+# ============================================================
 
+def _table_columns(conn, table_name):
+    """
+    Return all column names from a SQLite table.
+    """
+
+    try:
+        return {
+            row[1]
+            for row in conn.execute(
+                f"PRAGMA table_info({table_name})"
+            ).fetchall()
+        }
+
+    except Exception:
+        return set()
+
+
+def _ensure_column(
+    conn,
+    table_name,
+    column_name,
+    column_type,
+):
+    """
+    Add a missing column to an existing table.
+
+    This makes old databases compatible with
+    newer versions of the application.
+    """
+
+    columns = _table_columns(
+        conn,
+        table_name,
+    )
+
+    if column_name not in columns:
+
+        conn.execute(
+            f"ALTER TABLE {table_name} "
+            f"ADD COLUMN {column_name} {column_type}"
+        )
+
+
+# ============================================================
+# INITIALIZE DATABASE
+# ============================================================
 
 def init_db():
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS chat_sessions (
-                id VARCHAR(64) PRIMARY KEY,
-                title TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id VARCHAR(64) PRIMARY KEY,
-                session_id VARCHAR(64) NOT NULL,
-                role VARCHAR(32) NOT NULL,
-                content TEXT NOT NULL,
-                language VARCHAR(16),
-                created_at TEXT NOT NULL
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS message_media (
-                id VARCHAR(64) PRIMARY KEY,
-                message_id VARCHAR(64) NOT NULL,
-                media_type VARCHAR(64) NOT NULL,
-                caption TEXT,
-                timestamp_seconds DOUBLE PRECISION,
-                video_text TEXT,
-                mime_type VARCHAR(128),
-                data BYTEA,
-                metadata_json TEXT,
-                created_at TEXT NOT NULL
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS session_sources (
-                id VARCHAR(64) PRIMARY KEY,
-                session_id VARCHAR(64) NOT NULL,
-                source_type VARCHAR(64),
-                filename TEXT,
-                url TEXT,
-                file_hash VARCHAR(128),
-                metadata_json TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """))
+    """
+    Create the SQLite schema and safely migrate
+    older database versions.
 
-        # SQLite does not enforce foreign keys by default; indexes still help history queries.
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_media_message ON message_media(message_id, created_at)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sources_session ON session_sources(session_id, updated_at)"))
+    IMPORTANT:
+    Existing database data is preserved.
+    """
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT 'New Chat',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    language TEXT,
+                    tts_language TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id)
+                        REFERENCES chat_sessions(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS message_media (
+                    id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL,
+                    media_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(message_id)
+                        REFERENCES messages(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS session_sources (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    filename TEXT,
+                    source_type TEXT,
+                    source_url TEXT,
+                    file_hash TEXT,
+                    context TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id)
+                        REFERENCES chat_sessions(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS
+                    idx_messages_session
+                    ON messages(session_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS
+                    idx_sources_session
+                    ON session_sources(session_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS
+                    idx_message_media_message
+                    ON message_media(message_id, created_at);
+                """
+            )
+
+            # ====================================================
+            # MIGRATIONS
+            # ====================================================
+            #
+            # These are important because older versions of
+            # voice_assistant.db may already exist.
+            #
+            # CREATE TABLE IF NOT EXISTS does NOT update an
+            # existing table, so missing columns must be added
+            # manually.
+            # ====================================================
+
+            # messages table
+            _ensure_column(
+                conn,
+                "messages",
+                "language",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "messages",
+                "tts_language",
+                "TEXT",
+            )
+
+            # chat_sessions table
+            _ensure_column(
+                conn,
+                "chat_sessions",
+                "title",
+                "TEXT NOT NULL DEFAULT 'New Chat'",
+            )
+
+            # message_media table
+            _ensure_column(
+                conn,
+                "message_media",
+                "media_json",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "message_media",
+                "created_at",
+                "TEXT",
+            )
+
+            # session_sources table
+            _ensure_column(
+                conn,
+                "session_sources",
+                "filename",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "session_sources",
+                "source_type",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "session_sources",
+                "source_url",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "session_sources",
+                "file_hash",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "session_sources",
+                "context",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "session_sources",
+                "metadata_json",
+                "TEXT",
+            )
+
+            _ensure_column(
+                conn,
+                "session_sources",
+                "created_at",
+                "TEXT",
+            )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
 
 
-def create_session(title="New Chat"):
-    session_id = uuid.uuid4().hex
+# ============================================================
+# CREATE SESSION
+# ============================================================
+
+def create_session(
+    title="New Chat",
+    session_id=None,
+):
+    """
+    Create a new chat session.
+    """
+
+    init_db()
+
+    sid = session_id or str(uuid.uuid4())
     now = _now()
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO chat_sessions(id, title, created_at, updated_at)
-            VALUES (:id, :title, :created_at, :updated_at)
-        """), _params(id=session_id, title=title[:120] or "New Chat", created_at=now, updated_at=now))
-    return session_id
 
+    with _LOCK:
 
-def list_sessions(limit=50):
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT id, title, created_at, updated_at
-            FROM chat_sessions
-            ORDER BY updated_at DESC
-            LIMIT :limit
-        """), {"limit": limit}).mappings().all()
-    return [dict(r) for r in rows]
+        conn = _connect()
 
+        try:
 
-def get_session(session_id):
-    with engine.begin() as conn:
-        row = conn.execute(text("""
-            SELECT id, title, created_at, updated_at
-            FROM chat_sessions WHERE id=:id
-        """), {"id": session_id}).mappings().first()
-    return dict(row) if row else None
-
-
-def update_session_title(session_id, title):
-    with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE chat_sessions SET title=:title, updated_at=:updated_at WHERE id=:id
-        """), {"title": title[:120] or "New Chat", "updated_at": _now(), "id": session_id})
-
-
-def touch_session(session_id):
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE chat_sessions SET updated_at=:updated_at WHERE id=:id"),
-                     {"updated_at": _now(), "id": session_id})
-
-
-def save_message(session_id, role, content, language=None, source_media=None):
-    message_id = uuid.uuid4().hex
-    now = _now()
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO messages(id, session_id, role, content, language, created_at)
-            VALUES (:id, :session_id, :role, :content, :language, :created_at)
-        """), {
-            "id": message_id,
-            "session_id": session_id,
-            "role": role,
-            "content": content or "",
-            "language": language,
-            "created_at": now,
-        })
-
-        for media in source_media or []:
-            if not isinstance(media, dict):
-                continue
-            media_type = media.get("type")
-            data = media.get("data")
-            if media_type != "image" or not isinstance(data, (bytes, bytearray)):
-                continue
-            metadata = {}
-            for key in ("source_type", "source_position", "page_number", "url", "section", "timestamp"):
-                if key in media and media.get(key) is not None:
-                    metadata[key] = media.get(key)
-            conn.execute(text("""
-                INSERT INTO message_media(
-                    id, message_id, media_type, caption, timestamp_seconds,
-                    video_text, mime_type, data, metadata_json, created_at
-                ) VALUES (
-                    :id, :message_id, :media_type, :caption, :timestamp_seconds,
-                    :video_text, :mime_type, :data, :metadata_json, :created_at
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO chat_sessions
+                (
+                    id,
+                    title,
+                    created_at,
+                    updated_at
                 )
-            """), {
-                "id": uuid.uuid4().hex,
-                "message_id": message_id,
-                "media_type": media_type,
-                "caption": media.get("caption", "Source visual"),
-                "timestamp_seconds": media.get("timestamp"),
-                "video_text": media.get("video_text"),
-                "mime_type": media.get("mime_type", "image/png"),
-                "data": bytes(data),
-                "metadata_json": json.dumps(metadata, ensure_ascii=False),
-                "created_at": now,
-            })
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    title or "New Chat",
+                    now,
+                    now,
+                ),
+            )
 
-        conn.execute(text("UPDATE chat_sessions SET updated_at=:updated_at WHERE id=:id"),
-                     {"updated_at": now, "id": session_id})
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+    return sid
+
+
+# ============================================================
+# UPDATE SESSION
+# ============================================================
+
+def touch_session(
+    session_id,
+    title=None,
+):
+    """
+    Update the session timestamp and optionally
+    update its title.
+    """
+
+    if not session_id:
+        return
+
+    now = _now()
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            if title:
+
+                conn.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET title = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        title,
+                        now,
+                        session_id,
+                    ),
+                )
+
+            else:
+
+                conn.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        now,
+                        session_id,
+                    ),
+                )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+# ============================================================
+# SAVE MESSAGE
+# ============================================================
+
+def save_message(
+    session_id,
+    role,
+    content,
+    language=None,
+    tts_language=None,
+    media=None,
+):
+    """
+    Save a user/assistant message.
+
+    Optional media metadata is stored in message_media.
+    Actual binary files are intentionally NOT stored.
+    """
+
+    if not session_id or not content:
+        return None
+
+    init_db()
+
+    message_id = str(uuid.uuid4())
+    now = _now()
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            # ------------------------------------------------
+            # Save message
+            # ------------------------------------------------
+
+            conn.execute(
+                """
+                INSERT INTO messages
+                (
+                    id,
+                    session_id,
+                    role,
+                    content,
+                    language,
+                    tts_language,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    session_id,
+                    role,
+                    content,
+                    language,
+                    tts_language,
+                    now,
+                ),
+            )
+
+            # ------------------------------------------------
+            # Save media metadata
+            # ------------------------------------------------
+
+            if media:
+
+                safe_media = []
+
+                for item in media:
+
+                    if not isinstance(item, dict):
+                        continue
+
+                    cleaned = {}
+
+                    for key, value in item.items():
+
+                        # Never store temporary binary/audio data
+                        if key in {
+                            "data",
+                            "audio_file",
+                        }:
+                            continue
+
+                        try:
+
+                            json.dumps(
+                                value,
+                                ensure_ascii=False,
+                            )
+
+                            cleaned[key] = value
+
+                        except Exception:
+
+                            cleaned[key] = str(value)
+
+                    safe_media.append(cleaned)
+
+                if safe_media:
+
+                    conn.execute(
+                        """
+                        INSERT INTO message_media
+                        (
+                            id,
+                            message_id,
+                            media_json,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            message_id,
+                            json.dumps(
+                                safe_media,
+                                ensure_ascii=False,
+                            ),
+                            now,
+                        ),
+                    )
+
+            # ------------------------------------------------
+            # Update session timestamp
+            # ------------------------------------------------
+
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    session_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
 
     return message_id
 
 
+# ============================================================
+# LOAD MESSAGES
+# ============================================================
+
 def load_messages(session_id):
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT id, role, content, language, created_at
-            FROM messages
-            WHERE session_id=:session_id
-            ORDER BY created_at ASC
-        """), {"session_id": session_id}).mappings().all()
+    """
+    Load all messages belonging to a chat session.
+    """
 
-        media_rows = conn.execute(text("""
-            SELECT mm.message_id, mm.media_type, mm.caption, mm.timestamp_seconds,
-                   mm.video_text, mm.mime_type, mm.data, mm.metadata_json
-            FROM message_media mm
-            JOIN messages m ON m.id=mm.message_id
-            WHERE m.session_id=:session_id
-            ORDER BY mm.created_at ASC
-        """), {"session_id": session_id}).mappings().all()
+    if not session_id:
+        return []
 
-    media_by_message = {}
-    for row in media_rows:
-        item = {
-            "type": row["media_type"],
-            "caption": row["caption"] or "Source visual",
-            "timestamp": row["timestamp_seconds"],
-            "video_text": row["video_text"],
-            "mime_type": row["mime_type"] or "image/png",
-            "data": row["data"],
-        }
+    init_db()
+
+    with _LOCK:
+
+        conn = _connect()
+
         try:
-            item.update(json.loads(row["metadata_json"] or "{}"))
-        except Exception:
-            pass
-        media_by_message.setdefault(row["message_id"], []).append(item)
 
-    messages = []
-    for row in rows:
-        item = {
-            "role": row["role"],
-            "content": row["content"],
-            "language": row["language"] or "en",
-            "created_at": row["created_at"],
-        }
-        if row["id"] in media_by_message:
-            item["source_media"] = media_by_message[row["id"]]
-        messages.append(item)
-    return messages
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    role,
+                    content,
+                    language,
+                    tts_language,
+                    created_at
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            ).fetchall()
+
+            result = []
+
+            for row in rows:
+
+                item = {
+                    "role": row["role"],
+                    "content": row["content"],
+                }
+
+                if row["language"]:
+                    item["language"] = row["language"]
+
+                if row["tts_language"]:
+                    item["tts_language"] = row["tts_language"]
+
+                # --------------------------------------------
+                # Load media attached to this message
+                # --------------------------------------------
+
+                media_row = conn.execute(
+                    """
+                    SELECT media_json
+                    FROM message_media
+                    WHERE message_id = ?
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    (row["id"],),
+                ).fetchone()
+
+                if media_row:
+
+                    try:
+
+                        media_json = media_row["media_json"]
+
+                        if media_json:
+
+                            item["source_media"] = json.loads(
+                                media_json
+                            )
+
+                    except Exception:
+
+                        pass
+
+                result.append(item)
+
+            return result
+
+        finally:
+
+            conn.close()
 
 
-def save_source(session_id, source):
-    if not source:
+# ============================================================
+# CLEAR SESSION MESSAGES
+# ============================================================
+
+def clear_session_messages(session_id):
+    """
+    Delete all messages from a specific session.
+    """
+
+    if not session_id:
         return
-    source_type = source.get("source_type", "")
-    filename = source.get("filename", "")
-    url = filename if source_type == "website" else source.get("url", "")
-    file_hash = source.get("file_hash") or source.get("hash", "")
-    metadata = {
-        "extension": source.get("extension", ""),
-        "authenticated": bool(source.get("authenticated", False)),
-        "page_count": len(source.get("pdf_pages", []) or []),
-        "website_pages": len((source.get("website_data") or {}).get("pages", []) or []),
-        "video_language": source.get("video_language", ""),
-    }
-    now = _now()
-    with engine.begin() as conn:
-        existing = conn.execute(text("""
-            SELECT id FROM session_sources WHERE session_id=:session_id ORDER BY updated_at DESC LIMIT 1
-        """), {"session_id": session_id}).scalar()
-        if existing:
-            conn.execute(text("""
-                UPDATE session_sources
-                SET source_type=:source_type, filename=:filename, url=:url,
-                    file_hash=:file_hash, metadata_json=:metadata_json, updated_at=:updated_at
-                WHERE id=:id
-            """), {
-                "id": existing, "source_type": source_type, "filename": filename, "url": url,
-                "file_hash": file_hash, "metadata_json": json.dumps(metadata, ensure_ascii=False), "updated_at": now,
-            })
-        else:
-            conn.execute(text("""
-                INSERT INTO session_sources(
-                    id, session_id, source_type, filename, url, file_hash,
-                    metadata_json, created_at, updated_at
-                ) VALUES (:id,:session_id,:source_type,:filename,:url,:file_hash,:metadata_json,:created_at,:updated_at)
-            """), {
-                "id": uuid.uuid4().hex, "session_id": session_id, "source_type": source_type,
-                "filename": filename, "url": url, "file_hash": file_hash,
-                "metadata_json": json.dumps(metadata, ensure_ascii=False),
-                "created_at": now, "updated_at": now,
-            })
 
+    init_db()
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            conn.execute(
+                """
+                DELETE FROM messages
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    _now(),
+                    session_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+# ============================================================
+# SAVE SOURCE
+# ============================================================
+
+def save_source(
+    session_id,
+    source,
+):
+    """
+    Save uploaded document, video, image or website
+    source information for a session.
+    """
+
+    if not session_id or not source:
+        return None
+
+    init_db()
+
+    source_id = str(uuid.uuid4())
+    now = _now()
+
+    metadata = {}
+
+    for key, value in source.items():
+
+        # Do not store large/temporary data
+        if key in {
+            "uploaded_context",
+            "video_segments",
+            "pages",
+            "images",
+            "frames",
+            "video_path",
+        }:
+            continue
+
+        try:
+
+            json.dumps(
+                value,
+                ensure_ascii=False,
+            )
+
+            metadata[key] = value
+
+        except Exception:
+
+            metadata[key] = str(value)
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            conn.execute(
+                """
+                INSERT INTO session_sources
+                (
+                    id,
+                    session_id,
+                    filename,
+                    source_type,
+                    source_url,
+                    file_hash,
+                    context,
+                    metadata_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    session_id,
+                    source.get("filename") or "",
+                    source.get("source_type") or "",
+                    source.get("url")
+                    or source.get("source_url")
+                    or "",
+                    source.get("file_hash") or "",
+                    source.get("uploaded_context") or "",
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    session_id,
+                ),
+            )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+    return source_id
+
+
+# ============================================================
+# LIST CHAT SESSIONS
+# ============================================================
+
+def list_sessions(limit=50):
+    """
+    Return recent chat sessions.
+    """
+
+    init_db()
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            rows = conn.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    created_at,
+                    updated_at
+                FROM chat_sessions
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            return [
+                dict(row)
+                for row in rows
+            ]
+
+        finally:
+
+            conn.close()
+
+
+# ============================================================
+# DELETE SESSION
+# ============================================================
 
 def delete_session(session_id):
-    with engine.begin() as conn:
-        message_ids = [r[0] for r in conn.execute(text("SELECT id FROM messages WHERE session_id=:id"), {"id": session_id}).all()]
-        if message_ids:
-            for mid in message_ids:
-                conn.execute(text("DELETE FROM message_media WHERE message_id=:id"), {"id": mid})
-        conn.execute(text("DELETE FROM messages WHERE session_id=:id"), {"id": session_id})
-        conn.execute(text("DELETE FROM session_sources WHERE session_id=:id"), {"id": session_id})
-        conn.execute(text("DELETE FROM chat_sessions WHERE id=:id"), {"id": session_id})
+    """
+    Delete an entire chat session.
 
+    Due to ON DELETE CASCADE,
+    messages/media/sources belonging to it
+    are also removed.
+    """
 
-def clear_all_history():
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM message_media"))
-        conn.execute(text("DELETE FROM messages"))
-        conn.execute(text("DELETE FROM session_sources"))
-        conn.execute(text("DELETE FROM chat_sessions"))
+    if not session_id:
+        return
 
-
-try:
     init_db()
-except Exception as exc:
-    print("DATABASE INIT ERROR:", repr(exc))
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            conn.execute(
+                """
+                DELETE FROM chat_sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            )
+
+            conn.commit()
+
+        finally:
+
+            conn.close()
+
+
+# ============================================================
+# GET SINGLE SESSION
+# ============================================================
+
+def get_session(session_id):
+    """
+    Get information about one chat session.
+    """
+
+    if not session_id:
+        return None
+
+    init_db()
+
+    with _LOCK:
+
+        conn = _connect()
+
+        try:
+
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    created_at,
+                    updated_at
+                FROM chat_sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+
+            return dict(row) if row else None
+
+        finally:
+
+            conn.close()
+
+
+# ============================================================
+# INITIAL DATABASE SETUP
+# ============================================================
+
+init_db()
